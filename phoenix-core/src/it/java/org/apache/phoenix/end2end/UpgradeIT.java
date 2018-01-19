@@ -17,13 +17,9 @@
  */
 package org.apache.phoenix.end2end;
 
-import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static org.apache.phoenix.query.ConnectionQueryServicesImpl.UPGRADE_MUTEX;
-import static org.apache.phoenix.query.ConnectionQueryServicesImpl.UPGRADE_MUTEX_LOCKED;
 import static org.apache.phoenix.query.ConnectionQueryServicesImpl.UPGRADE_MUTEX_UNLOCKED;
-import static org.apache.phoenix.query.QueryConstants.BASE_TABLE_BASE_COLUMN_COUNT;
-import static org.apache.phoenix.query.QueryConstants.DIVERGED_VIEW_BASE_COLUMN_COUNT;
 import static org.apache.phoenix.util.UpgradeUtil.SELECT_BASE_COLUMN_COUNT_FROM_HEADER_ROW;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -37,15 +33,15 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.curator.shaded.com.google.common.collect.Sets;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HTableInterface;
@@ -58,16 +54,23 @@ import org.apache.phoenix.exception.UpgradeInProgressException;
 import org.apache.phoenix.exception.UpgradeRequiredException;
 import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.jdbc.PhoenixDatabaseMetaData;
+import org.apache.phoenix.parse.PFunction;
 import org.apache.phoenix.query.ConnectionQueryServices;
 import org.apache.phoenix.query.ConnectionQueryServicesImpl;
 import org.apache.phoenix.query.DelegateConnectionQueryServices;
 import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.query.QueryServices;
+import org.apache.phoenix.schema.PMetaData;
 import org.apache.phoenix.schema.PName;
 import org.apache.phoenix.schema.PNameFactory;
+import org.apache.phoenix.schema.PTable;
+import org.apache.phoenix.schema.PTable.LinkType;
+import org.apache.phoenix.schema.PTableType;
 import org.apache.phoenix.util.MetaDataUtil;
 import org.apache.phoenix.util.PhoenixRuntime;
+import org.apache.phoenix.util.PropertiesUtil;
 import org.apache.phoenix.util.SchemaUtil;
+import org.apache.phoenix.util.TestUtil;
 import org.apache.phoenix.util.UpgradeUtil;
 import org.junit.Before;
 import org.junit.Test;
@@ -79,79 +82,6 @@ public class UpgradeIT extends ParallelStatsDisabledIT {
     @Before
     public void generateTenantId() {
         tenantId = "T_" + generateUniqueName();
-    }
-
-    @Test
-    public void testUpgradeForTenantViewWithSameColumnsAsBaseTable() throws Exception {
-        String tableWithViewName = generateUniqueName();
-        String viewTableName = generateUniqueName();
-        testViewUpgrade(true, tenantId, null, tableWithViewName + "1", null, viewTableName + "1", ColumnDiff.EQUAL);
-        testViewUpgrade(true, tenantId, "TABLESCHEMA", tableWithViewName + "", null, viewTableName + "2",
-            ColumnDiff.EQUAL);
-        testViewUpgrade(true, tenantId, null, tableWithViewName + "3", viewTableName + "SCHEMA", viewTableName + "3",
-            ColumnDiff.EQUAL);
-        testViewUpgrade(true, tenantId, "TABLESCHEMA", tableWithViewName + "4", viewTableName + "SCHEMA", viewTableName + "4",
-            ColumnDiff.EQUAL);
-        testViewUpgrade(true, tenantId, "SAMESCHEMA", tableWithViewName + "5", "SAMESCHEMA", viewTableName + "5",
-            ColumnDiff.EQUAL);
-    }
-
-    @Test
-    public void testUpgradeForTenantViewWithMoreColumnsThanBaseTable() throws Exception {
-        String tableWithViewName = generateUniqueName();
-        String viewTableName = generateUniqueName();
-        testViewUpgrade(true, tenantId, null, tableWithViewName + "1", null, viewTableName + "1", ColumnDiff.MORE);
-        testViewUpgrade(true, tenantId, "TABLESCHEMA", tableWithViewName + "", null, viewTableName + "2",
-            ColumnDiff.MORE);
-        testViewUpgrade(true, tenantId, null, tableWithViewName + "3", "VIEWSCHEMA", viewTableName + "3",
-            ColumnDiff.MORE);
-        testViewUpgrade(true, tenantId, "TABLESCHEMA", tableWithViewName + "4", "VIEWSCHEMA", viewTableName + "4",
-            ColumnDiff.MORE);
-        testViewUpgrade(true, tenantId, "SAMESCHEMA", tableWithViewName + "5", "SAMESCHEMA", viewTableName + "5",
-            ColumnDiff.MORE);
-    }
-
-    @Test
-    public void testUpgradeForViewWithSameColumnsAsBaseTable() throws Exception {
-        String tableWithViewName = generateUniqueName();
-        String viewTableName = generateUniqueName();
-        testViewUpgrade(false, null, null, tableWithViewName + "1", null, viewTableName + "1", ColumnDiff.EQUAL);
-        testViewUpgrade(false, null, "TABLESCHEMA", tableWithViewName + "", null, viewTableName + "2",
-            ColumnDiff.EQUAL);
-        testViewUpgrade(false, null, null, tableWithViewName + "3", "VIEWSCHEMA", viewTableName + "3",
-            ColumnDiff.EQUAL);
-        testViewUpgrade(false, null, "TABLESCHEMA", tableWithViewName + "4", "VIEWSCHEMA", viewTableName + "4",
-            ColumnDiff.EQUAL);
-        testViewUpgrade(false, null, "SAMESCHEMA", tableWithViewName + "5", "SAMESCHEMA", viewTableName + "5",
-            ColumnDiff.EQUAL);
-    }
-
-    @Test
-    public void testUpgradeForViewWithMoreColumnsThanBaseTable() throws Exception {
-        String tableWithViewName = generateUniqueName();
-        String viewTableName = generateUniqueName();
-        testViewUpgrade(false, null, null, tableWithViewName + "1", null, viewTableName + "1", ColumnDiff.MORE);
-        testViewUpgrade(false, null, "TABLESCHEMA", tableWithViewName + "", null, viewTableName + "2", ColumnDiff.MORE);
-        testViewUpgrade(false, null, null, tableWithViewName + "3", "VIEWSCHEMA", viewTableName + "3", ColumnDiff.MORE);
-        testViewUpgrade(false, null, "TABLESCHEMA", tableWithViewName + "4", "VIEWSCHEMA", viewTableName + "4",
-            ColumnDiff.MORE);
-        testViewUpgrade(false, null, "SAMESCHEMA", tableWithViewName + "5", "SAMESCHEMA", viewTableName + "5",
-            ColumnDiff.MORE);
-    }
-
-    @Test
-    public void testSettingBaseColumnCountWhenBaseTableColumnDropped() throws Exception {
-        String tableWithViewName = generateUniqueName();
-        String viewTableName = generateUniqueName();
-        testViewUpgrade(true, tenantId, null, tableWithViewName + "1", null, viewTableName + "1", ColumnDiff.MORE);
-        testViewUpgrade(true, tenantId, "TABLESCHEMA", tableWithViewName + "", null, viewTableName + "2",
-            ColumnDiff.LESS);
-        testViewUpgrade(true, tenantId, null, tableWithViewName + "3", "VIEWSCHEMA", viewTableName + "3",
-            ColumnDiff.LESS);
-        testViewUpgrade(true, tenantId, "TABLESCHEMA", tableWithViewName + "4", "VIEWSCHEMA", viewTableName + "4",
-            ColumnDiff.LESS);
-        testViewUpgrade(true, tenantId, "SAMESCHEMA", tableWithViewName + "5", "SAMESCHEMA", viewTableName + "5",
-            ColumnDiff.LESS);
     }
 
     @Test
@@ -228,6 +158,16 @@ public class UpgradeIT extends ParallelStatsDisabledIT {
             phxConn.close();
             props = new Properties();
             phxConn = DriverManager.getConnection(getUrl(), props).unwrap(PhoenixConnection.class);
+            // purge MetaDataCache except for system tables
+            phxConn.getMetaDataCache().pruneTables(new PMetaData.Pruner() {
+                @Override public boolean prune(PTable table) {
+                    return table.getType() != PTableType.SYSTEM;
+                }
+
+                @Override public boolean prune(PFunction function) {
+                    return false;
+                }
+            });
             admin = phxConn.getQueryServices().getAdmin();
             String hbaseTableName = SchemaUtil.getPhysicalTableName(Bytes.toBytes(phoenixFullTableName), true)
                     .getNameAsString();
@@ -351,6 +291,16 @@ public class UpgradeIT extends ParallelStatsDisabledIT {
         UpgradeUtil.mapChildViewsToNamespace(phxConn,phoenixFullTableName,props);
         props.setProperty(PhoenixRuntime.TENANT_ID_ATTRIB, tenantId);
         phxConn = DriverManager.getConnection(getUrl(), props).unwrap(PhoenixConnection.class);
+        // purge MetaDataCache except for system tables
+        phxConn.getMetaDataCache().pruneTables(new PMetaData.Pruner() {
+            @Override public boolean prune(PTable table) {
+                return table.getType() != PTableType.SYSTEM;
+            }
+
+            @Override public boolean prune(PFunction function) {
+                return false;
+            }
+        });
         int i = 1;
         String indexPhysicalTableName = Bytes
                 .toString(MetaDataUtil.getViewIndexPhysicalName(Bytes.toBytes(hbaseTableName)));
@@ -395,216 +345,7 @@ public class UpgradeIT extends ParallelStatsDisabledIT {
         assertTrue(rs.next());
         assertTrue(rs.getString(1).contains(hbaseTableName));
     }
-    
-
-    @Test
-    public void testSettingBaseColumnCountForMultipleViewsOnTable() throws Exception {
-        String baseSchema = "S_" + generateUniqueName();
-        String baseTable = "T_" + generateUniqueName();
-        String fullBaseTableName = SchemaUtil.getTableName(baseSchema, baseTable);
-        try (Connection conn = DriverManager.getConnection(getUrl())) {
-            String baseTableDDL = "CREATE TABLE " + fullBaseTableName + " (TENANT_ID VARCHAR NOT NULL, PK1 VARCHAR NOT NULL, V1 INTEGER, V2 INTEGER CONSTRAINT NAME_PK PRIMARY KEY(TENANT_ID, PK1)) MULTI_TENANT = true";
-            conn.createStatement().execute(baseTableDDL);
-
-            String[] tenants = new String[] {"T_" + generateUniqueName(), "T_" + generateUniqueName()};
-            Collections.sort(Arrays.asList(tenants));
-            String[] tenantViews = new String[] {"V_" + generateUniqueName(), "V_" + generateUniqueName(), "V_" + generateUniqueName()};
-            Collections.sort(Arrays.asList(tenantViews));
-            String[] globalViews = new String[] {"G_" + generateUniqueName(), "G_" + generateUniqueName(), "G_" + generateUniqueName()};
-            Collections.sort(Arrays.asList(globalViews));
-            for (int i = 0; i < 2; i++) {
-                // Create views for tenants;
-                String tenant = tenants[i];
-                try (Connection tenantConn = createTenantConnection(tenant)) {
-                    String view = tenantViews[0];
-                    // view with its own column
-                    String viewDDL = "CREATE VIEW " + view + " AS SELECT * FROM " + fullBaseTableName;
-                    tenantConn.createStatement().execute(viewDDL);
-                    String addCols = "ALTER VIEW " + view + " ADD COL1 VARCHAR ";
-                    tenantConn.createStatement().execute(addCols);
-                    removeBaseColumnCountKV(tenant, null, view);
-
-                    // view that has the last base table column removed
-                    view = tenantViews[1];
-                    viewDDL = "CREATE VIEW " + view + " AS SELECT * FROM " + fullBaseTableName;
-                    tenantConn.createStatement().execute(viewDDL);
-                    String droplastBaseCol = "ALTER VIEW " + view + " DROP COLUMN V2";
-                    tenantConn.createStatement().execute(droplastBaseCol);
-                    removeBaseColumnCountKV(tenant, null, view);
-
-                    // view that has the middle base table column removed
-                    view = tenantViews[2];
-                    viewDDL = "CREATE VIEW " + view + " AS SELECT * FROM " + fullBaseTableName;
-                    tenantConn.createStatement().execute(viewDDL);
-                    String dropMiddileBaseCol = "ALTER VIEW " + view + " DROP COLUMN V1";
-                    tenantConn.createStatement().execute(dropMiddileBaseCol);
-                    removeBaseColumnCountKV(tenant, null, view);
-                }
-            }
-
-            // create global views
-            try (Connection globalConn = DriverManager.getConnection(getUrl())) {
-                String globalView = globalViews[0];
-                // view with its own column
-                String viewDDL = "CREATE VIEW " + globalView + " AS SELECT * FROM " + fullBaseTableName;
-                globalConn.createStatement().execute(viewDDL);
-                String addCols = "ALTER VIEW " + globalView + " ADD COL1 VARCHAR ";
-                globalConn.createStatement().execute(addCols);
-                removeBaseColumnCountKV(null, null, globalView);
-
-                // view that has the last base table column removed
-                globalView = globalViews[1];
-                viewDDL = "CREATE VIEW " + globalView + " AS SELECT * FROM " + fullBaseTableName;
-                globalConn.createStatement().execute(viewDDL);
-                String droplastBaseCol = "ALTER VIEW " + globalView + " DROP COLUMN V2";
-                globalConn.createStatement().execute(droplastBaseCol);
-                removeBaseColumnCountKV(null, null, globalView);
-
-                // view that has the middle base table column removed
-                globalView = globalViews[2];
-                viewDDL = "CREATE VIEW " + globalView + " AS SELECT * FROM " + fullBaseTableName;
-                globalConn.createStatement().execute(viewDDL);
-                String dropMiddileBaseCol = "ALTER VIEW " + globalView + " DROP COLUMN V1";
-                globalConn.createStatement().execute(dropMiddileBaseCol);
-                removeBaseColumnCountKV(null, null, globalView);
-            }
-            
-            // run upgrade
-            UpgradeUtil.upgradeTo4_5_0(conn.unwrap(PhoenixConnection.class));
-            
-            // Verify base column counts for tenant specific views
-            for (int i = 0; i < 2 ; i++) {
-                String tenantId = tenants[i];
-                checkBaseColumnCount(tenantId, null, tenantViews[0], 4);
-                checkBaseColumnCount(tenantId, null, tenantViews[1], DIVERGED_VIEW_BASE_COLUMN_COUNT);
-                checkBaseColumnCount(tenantId, null, tenantViews[2], DIVERGED_VIEW_BASE_COLUMN_COUNT);
-            }
-            
-            // Verify base column count for global views
-            checkBaseColumnCount(null, null, globalViews[0], 4);
-            checkBaseColumnCount(null, null, globalViews[1], DIVERGED_VIEW_BASE_COLUMN_COUNT);
-            checkBaseColumnCount(null, null, globalViews[2], DIVERGED_VIEW_BASE_COLUMN_COUNT);
-        }
         
-        
-    }
-    
-    private enum ColumnDiff {
-        MORE, EQUAL, LESS
-    };
-
-    private void testViewUpgrade(boolean tenantView, String tenantId, String baseTableSchema,
-            String baseTableName, String viewSchema, String viewName, ColumnDiff diff)
-            throws Exception {
-        if (tenantView) {
-            checkNotNull(tenantId);
-        } else {
-            checkArgument(tenantId == null);
-        }
-        Connection conn = DriverManager.getConnection(getUrl());
-        String fullViewName = SchemaUtil.getTableName(viewSchema, viewName);
-        String fullBaseTableName = SchemaUtil.getTableName(baseTableSchema, baseTableName);
-        try {
-            int expectedBaseColumnCount;
-            conn.createStatement().execute(
-                "CREATE TABLE IF NOT EXISTS " + fullBaseTableName + " ("
-                        + " TENANT_ID CHAR(15) NOT NULL, " + " PK1 integer NOT NULL, "
-                        + "PK2 bigint NOT NULL, " + "CF1.V1 VARCHAR, " + "CF2.V2 VARCHAR, "
-                        + "V3 CHAR(100) ARRAY[4] "
-                        + " CONSTRAINT NAME_PK PRIMARY KEY (TENANT_ID, PK1, PK2)"
-                        + " ) MULTI_TENANT= true");
-            
-            // create a view with same columns as base table.
-            try (Connection conn2 = getConnection(tenantView, tenantId)) {
-                conn2.createStatement().execute(
-                    "CREATE VIEW " + fullViewName + " AS SELECT * FROM " + fullBaseTableName);
-            }
-
-            if (diff == ColumnDiff.MORE) {
-                    // add a column to the view
-                    try (Connection conn3 = getConnection(tenantView, tenantId)) {
-                        conn3.createStatement().execute(
-                            "ALTER VIEW " + fullViewName + " ADD VIEW_COL1 VARCHAR");
-                    }
-            }
-            if (diff == ColumnDiff.LESS) {
-                try (Connection conn3 = getConnection(tenantView, tenantId)) {
-                    conn3.createStatement().execute(
-                        "ALTER VIEW " + fullViewName + " DROP COLUMN CF2.V2");
-                }
-                expectedBaseColumnCount = DIVERGED_VIEW_BASE_COLUMN_COUNT;
-            } else {
-                expectedBaseColumnCount = 6;
-            }
-
-            checkBaseColumnCount(tenantId, viewSchema, viewName, expectedBaseColumnCount);
-            checkBaseColumnCount(null, baseTableSchema, baseTableName, BASE_TABLE_BASE_COLUMN_COUNT);
-            
-            // remove base column count kv so we can check whether the upgrade code is setting the 
-            // base column count correctly.
-            removeBaseColumnCountKV(tenantId, viewSchema, viewName);
-            removeBaseColumnCountKV(null, baseTableSchema, baseTableName);
-
-            // assert that the removing base column count key value worked correctly.
-            checkBaseColumnCount(tenantId, viewSchema, viewName, 0);
-            checkBaseColumnCount(null, baseTableSchema, baseTableName, 0);
-            
-            // run upgrade
-            UpgradeUtil.upgradeTo4_5_0(conn.unwrap(PhoenixConnection.class));
-
-            checkBaseColumnCount(tenantId, viewSchema, viewName, expectedBaseColumnCount);
-            checkBaseColumnCount(null, baseTableSchema, baseTableName, BASE_TABLE_BASE_COLUMN_COUNT);
-        } finally {
-            conn.close();
-        }
-    }
-
-    private static void checkBaseColumnCount(String tenantId, String schemaName, String tableName,
-            int expectedBaseColumnCount) throws Exception {
-        checkNotNull(tableName);
-        Connection conn = DriverManager.getConnection(getUrl());
-        String sql = SELECT_BASE_COLUMN_COUNT_FROM_HEADER_ROW;
-        sql =
-                String.format(sql, tenantId == null ? " IS NULL " : " = ? ",
-                    schemaName == null ? "IS NULL" : " = ? ");
-        int paramIndex = 1;
-        PreparedStatement stmt = conn.prepareStatement(sql);
-        if (tenantId != null) {
-            stmt.setString(paramIndex++, tenantId);
-        }
-        if (schemaName != null) {
-            stmt.setString(paramIndex++, schemaName);
-        }
-        stmt.setString(paramIndex, tableName);
-        ResultSet rs = stmt.executeQuery();
-        assertTrue(rs.next());
-        assertEquals(expectedBaseColumnCount, rs.getInt(1));
-        assertFalse(rs.next());
-    }
-
-    private static void
-            removeBaseColumnCountKV(String tenantId, String schemaName, String tableName)
-                    throws Exception {
-        byte[] rowKey =
-                SchemaUtil.getTableKey(tenantId == null ? new byte[0] : Bytes.toBytes(tenantId),
-                    schemaName == null ? new byte[0] : Bytes.toBytes(schemaName),
-                    Bytes.toBytes(tableName));
-        Put viewColumnDefinitionPut = new Put(rowKey, HConstants.LATEST_TIMESTAMP);
-        viewColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-            PhoenixDatabaseMetaData.BASE_COLUMN_COUNT_BYTES, HConstants.LATEST_TIMESTAMP, null);
-
-        try (PhoenixConnection conn =
-                (DriverManager.getConnection(getUrl())).unwrap(PhoenixConnection.class)) {
-            try (HTableInterface htable =
-                    conn.getQueryServices().getTable(
-                        Bytes.toBytes(PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME))) {
-                RowMutations mutations = new RowMutations(rowKey);
-                mutations.add(viewColumnDefinitionPut);
-                htable.mutateRow(mutations);
-            }
-        }
-    }
-    
     @Test
     public void testUpgradeRequiredPreventsSQL() throws SQLException {
         String tableName = generateUniqueName();
@@ -619,8 +360,8 @@ public class UpgradeIT extends ParallelStatsDisabledIT {
                     return true;
                 }
             };
-            try (PhoenixConnection phxConn = new PhoenixConnection(servicesWithUpgrade,
-                    conn.unwrap(PhoenixConnection.class), HConstants.LATEST_TIMESTAMP)) {
+            try (PhoenixConnection phxConn = new PhoenixConnection(servicesWithUpgrade, getUrl(), PropertiesUtil.deepCopy(TestUtil.TEST_PROPERTIES), 
+                    conn.unwrap(PhoenixConnection.class).getMetaDataCache())) {
                 try {
                     phxConn.createStatement().execute(
                             "CREATE TABLE " + generateUniqueName()
@@ -675,8 +416,8 @@ public class UpgradeIT extends ParallelStatsDisabledIT {
                     return true;
                 }
             };
-            try (PhoenixConnection phxConn = new PhoenixConnection(servicesWithUpgrade,
-                    conn.unwrap(PhoenixConnection.class), HConstants.LATEST_TIMESTAMP)) {
+			try (PhoenixConnection phxConn = new PhoenixConnection(conn.unwrap(PhoenixConnection.class),
+					servicesWithUpgrade, conn.getClientInfo())) {
                 // Because upgrade is required, this SQL should fail.
                 try {
                     phxConn.createStatement().executeQuery("SELECT * FROM " + tableName);
@@ -807,4 +548,74 @@ public class UpgradeIT extends ParallelStatsDisabledIT {
         return DriverManager.getConnection(getUrl());
     }
     
+    @Test
+    public void testAddParentChildLinks() throws Exception {
+        String schema = "S_" + generateUniqueName();
+        String table1 = "T_" + generateUniqueName();
+        String table2 = "T_" + generateUniqueName();
+        String tableName = SchemaUtil.getTableName(schema, table1);
+        String multiTenantTableName = SchemaUtil.getTableName(schema, table2);
+        String viewName1 = "VIEW_" + generateUniqueName();
+        String viewIndexName1 = "VIDX_" + generateUniqueName();
+        String viewName2 = "VIEW_" + generateUniqueName();
+        String viewIndexName2 = "VIDX_" + generateUniqueName();
+        try (Connection conn = getConnection(false, null);
+                Connection tenantConn = getConnection(true, "tenant1");
+                Connection metaConn = getConnection(false, null)) {
+            // create a non multi-tenant and multi-tenant table
+            conn.createStatement()
+                    .execute("CREATE TABLE IF NOT EXISTS " + tableName + " ("
+                            + " TENANT_ID CHAR(15) NOT NULL, " + " PK1 integer NOT NULL, "
+                            + "PK2 bigint NOT NULL, " + "V1 VARCHAR, " + "V2 VARCHAR "
+                            + " CONSTRAINT NAME_PK PRIMARY KEY (TENANT_ID, PK1, PK2))");
+            conn.createStatement()
+                    .execute("CREATE TABLE IF NOT EXISTS " + multiTenantTableName + " ("
+                            + " TENANT_ID CHAR(15) NOT NULL, " + " PK1 integer NOT NULL, "
+                            + "PK2 bigint NOT NULL, " + "V1 VARCHAR, " + "V2 VARCHAR "
+                            + " CONSTRAINT NAME_PK PRIMARY KEY (TENANT_ID, PK1, PK2)"
+                            + " ) MULTI_TENANT= true");
+            // create tenant and global view
+            conn.createStatement().execute(
+                "CREATE VIEW " + viewName1 + " (col VARCHAR) AS SELECT * FROM " + tableName);
+            tenantConn.createStatement().execute("CREATE VIEW " + viewName2
+                    + "(col VARCHAR) AS SELECT * FROM " + multiTenantTableName);
+            // create index on the above views
+            conn.createStatement()
+                    .execute("create index " + viewIndexName1 + "  on " + viewName1 + "(col)");
+            tenantConn.createStatement()
+                    .execute("create index " + viewIndexName2 + " on " + viewName2 + "(col)");
+
+            // query all parent -> child links
+            Set<String> expectedChildLinkSet = getChildLinks(conn);
+
+            // delete all the child links
+            conn.createStatement().execute("DELETE FROM SYSTEM.CATALOG WHERE LINK_TYPE = "
+                    + LinkType.CHILD_TABLE.getSerializedValue());
+
+            // re-create them by running the upgrade code
+            PhoenixConnection phxMetaConn = metaConn.unwrap(PhoenixConnection.class);
+            phxMetaConn.setRunningUpgrade(true);
+            UpgradeUtil.addParentToChildLinks(phxMetaConn);
+            Set<String> actualChildLinkSet = getChildLinks(conn);
+
+            assertEquals("Unexpected child links", expectedChildLinkSet, actualChildLinkSet);
+        }
+    }
+
+    private Set<String> getChildLinks(Connection conn) throws SQLException {
+        ResultSet rs =
+                conn.createStatement().executeQuery(
+                    "SELECT TENANT_ID, TABLE_SCHEM, TABLE_NAME, COLUMN_NAME, COLUMN_FAMILY FROM SYSTEM.CATALOG WHERE LINK_TYPE = "
+                            + LinkType.CHILD_TABLE.getSerializedValue());
+        Set<String> childLinkSet = Sets.newHashSet();
+        while (rs.next()) {
+            String key =
+                    rs.getString("TENANT_ID") + " " + rs.getString("TABLE_SCHEM") + " "
+                            + rs.getString("TABLE_NAME") + " " + rs.getString("COLUMN_NAME") + " "
+                            + rs.getString("COLUMN_FAMILY");
+            childLinkSet.add(key);
+        }
+        return childLinkSet;
+    }
+
 }

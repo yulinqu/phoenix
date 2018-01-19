@@ -48,6 +48,8 @@ message PColumn {
   optional bool isRowTimestamp = 13;
   optional bool isDynamic = 14;
   optional bytes columnQualifierBytes = 15;
+  optional int64 timestamp = 16;
+  optional bool derived = 17 [default = false];
 }
 
 message PTableStats {
@@ -99,6 +101,7 @@ message PTable {
   optional bytes storageScheme = 34;
   optional bytes encodingScheme = 35;
   repeated EncodedCQCounter encodedCQCounters = 36;
+  optional bool useStatsForParallelization = 37;
 }
 
 message EncodedCQCounter {

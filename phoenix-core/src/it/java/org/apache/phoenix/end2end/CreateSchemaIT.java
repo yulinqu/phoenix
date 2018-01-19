@@ -30,54 +30,74 @@ import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.phoenix.exception.SQLExceptionCode;
 import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.query.QueryServices;
-import org.apache.phoenix.schema.NewerSchemaAlreadyExistsException;
 import org.apache.phoenix.schema.SchemaAlreadyExistsException;
-import org.apache.phoenix.util.PhoenixRuntime;
+import org.apache.phoenix.util.PropertiesUtil;
 import org.apache.phoenix.util.SchemaUtil;
+import org.apache.phoenix.util.TestUtil;
 import org.junit.Test;
 
-public class CreateSchemaIT extends BaseClientManagedTimeIT {
+public class CreateSchemaIT extends ParallelStatsDisabledIT {
 
     @Test
     public void testCreateSchema() throws Exception {
-        long ts = nextTimestamp();
-        Properties props = new Properties();
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts));
+        Properties props = PropertiesUtil.deepCopy(TestUtil.TEST_PROPERTIES);
         props.setProperty(QueryServices.IS_NAMESPACE_MAPPING_ENABLED, Boolean.toString(true));
-        String ddl = "CREATE SCHEMA TEST_SCHEMA";
+        String schemaName = generateUniqueName();
+        String schemaName1 = schemaName.toLowerCase();
+        String schemaName2 = schemaName.toLowerCase();
+        // Create unique name schema and verify that it exists
+        // ddl1 should create lowercase schemaName since it is passed in with double-quotes
+        // ddl2 should create uppercase schemaName since Phoenix upper-cases identifiers without quotes
+        // Both the statements should succeed
+        String ddl1 = "CREATE SCHEMA \"" + schemaName1 + "\"";
+        String ddl2 = "CREATE SCHEMA " + schemaName2;
         try (Connection conn = DriverManager.getConnection(getUrl(), props);
                 HBaseAdmin admin = conn.unwrap(PhoenixConnection.class).getQueryServices().getAdmin();) {
-            conn.createStatement().execute(ddl);
-            assertNotNull(admin.getNamespaceDescriptor("TEST_SCHEMA"));
+            conn.createStatement().execute(ddl1);
+            assertNotNull(admin.getNamespaceDescriptor(schemaName1));
+            conn.createStatement().execute(ddl2);
+            assertNotNull(admin.getNamespaceDescriptor(schemaName2.toUpperCase()));
         }
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 10));
-        try (Connection conn = DriverManager.getConnection(getUrl(), props);) {
-            conn.createStatement().execute(ddl);
+        // Try creating it again and verify that it throws SchemaAlreadyExistsException
+        try (Connection conn = DriverManager.getConnection(getUrl(), props)) {
+            conn.createStatement().execute(ddl1);
             fail();
         } catch (SchemaAlreadyExistsException e) {
             // expected
         }
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts - 20));
-        try (Connection conn = DriverManager.getConnection(getUrl(), props)) {
-            conn.createStatement().execute(ddl);
-            fail();
-        } catch (NewerSchemaAlreadyExistsException e) {
-            // expected
+
+        // See PHOENIX-4424
+        // Create schema DEFAULT and HBASE (Should allow since they are upper-cased) and verify that it exists
+        // Create schema default and hbase and it should fail
+        try (Connection conn = DriverManager.getConnection(getUrl(), props);
+             HBaseAdmin admin = conn.unwrap(PhoenixConnection.class).getQueryServices().getAdmin();) {
+
+            // default is a SQL keyword, hence it should always be passed in double-quotes
+            try {
+                conn.createStatement().execute("CREATE SCHEMA \""
+                        + SchemaUtil.SCHEMA_FOR_DEFAULT_NAMESPACE + "\"");
+                fail();
+            } catch (SQLException e) {
+                assertEquals(SQLExceptionCode.SCHEMA_NOT_ALLOWED.getErrorCode(), e.getErrorCode());
+            }
+
+            try {
+                conn.createStatement().execute("CREATE SCHEMA \""
+                        + SchemaUtil.HBASE_NAMESPACE + "\"");
+                fail();
+            } catch (SQLException e) {
+                assertEquals(SQLExceptionCode.SCHEMA_NOT_ALLOWED.getErrorCode(), e.getErrorCode());
+            }
+
+            // default is a SQL keyword, hence it should always be passed in double-quotes
+            conn.createStatement().execute("CREATE SCHEMA \""
+                    + SchemaUtil.SCHEMA_FOR_DEFAULT_NAMESPACE.toUpperCase() + "\"");
+            conn.createStatement().execute("CREATE SCHEMA \""
+                    + SchemaUtil.HBASE_NAMESPACE.toUpperCase() + "\"");
+
+            assertNotNull(admin.getNamespaceDescriptor(SchemaUtil.SCHEMA_FOR_DEFAULT_NAMESPACE.toUpperCase()));
+            assertNotNull(admin.getNamespaceDescriptor(SchemaUtil.HBASE_NAMESPACE.toUpperCase()));
+
         }
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 50));
-        Connection conn = DriverManager.getConnection(getUrl(), props);
-        try {
-            conn.createStatement().execute("CREATE SCHEMA " + SchemaUtil.SCHEMA_FOR_DEFAULT_NAMESPACE);
-            fail();
-        } catch (SQLException e) {
-            assertEquals(SQLExceptionCode.SCHEMA_NOT_ALLOWED.getErrorCode(), e.getErrorCode());
-        }
-        try {
-            conn.createStatement().execute("CREATE SCHEMA " + SchemaUtil.HBASE_NAMESPACE);
-            fail();
-        } catch (SQLException e) {
-            assertEquals(SQLExceptionCode.SCHEMA_NOT_ALLOWED.getErrorCode(), e.getErrorCode());
-        }
-        conn.close();
     }
 }

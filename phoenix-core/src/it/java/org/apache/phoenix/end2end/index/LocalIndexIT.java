@@ -17,6 +17,7 @@
  */
 package org.apache.phoenix.end2end.index;
 
+import static org.apache.phoenix.end2end.ExplainPlanWithStatsEnabledIT.getByteRowEstimates;
 import static org.apache.phoenix.util.MetaDataUtil.getViewIndexSequenceName;
 import static org.apache.phoenix.util.MetaDataUtil.getViewIndexSequenceSchemaName;
 import static org.junit.Assert.assertArrayEquals;
@@ -55,8 +56,10 @@ import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.phoenix.compile.QueryPlan;
 import org.apache.phoenix.coprocessor.BaseScannerRegionObserver;
+import org.apache.phoenix.end2end.ExplainPlanWithStatsEnabledIT.Estimate;
 import org.apache.phoenix.hbase.index.IndexRegionSplitPolicy;
 import org.apache.phoenix.jdbc.PhoenixConnection;
+import org.apache.phoenix.jdbc.PhoenixResultSet;
 import org.apache.phoenix.jdbc.PhoenixStatement;
 import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.schema.PNameFactory;
@@ -67,16 +70,16 @@ import org.apache.phoenix.schema.TableNotFoundException;
 import org.apache.phoenix.util.QueryUtil;
 import org.apache.phoenix.util.SchemaUtil;
 import org.apache.phoenix.util.TestUtil;
-import org.junit.Ignore;
 import org.junit.Test;
+
+import com.google.common.collect.Lists;
 
 public class LocalIndexIT extends BaseLocalIndexIT {
     public LocalIndexIT(boolean isNamespaceMapped) {
         super(isNamespaceMapped);
     }
     
-    @Ignore
-    //FIXME: PHOENIX-3496 
+    @Test
     public void testLocalIndexRoundTrip() throws Exception {
         String tableName = schemaName + "." + generateUniqueName();
         String indexName = "IDX_" + generateUniqueName();
@@ -562,7 +565,7 @@ public class LocalIndexIT extends BaseLocalIndexIT {
             String tableName = generateUniqueName();
             String indexName = generateUniqueName();
             statement.execute("create table " + tableName + " (id integer not null,fn varchar,"
-                    + "ln varchar constraint pk primary key(id)) DEFAULT_COLUMN_FAMILY='F'");
+                    + "\"ln\" varchar constraint pk primary key(id)) DEFAULT_COLUMN_FAMILY='F'");
             statement.execute("upsert into " + tableName + "  values(1,'fn','ln')");
             statement
                     .execute("create local index " + indexName + " on " + tableName + "  (fn)");
@@ -585,36 +588,78 @@ public class LocalIndexIT extends BaseLocalIndexIT {
             String indexName = "IDX_T_AUTO_MATIC_REPAIR";
             String indexName1 = "IDX_T_AUTO_MATIC_REPAIR_1";
             statement.execute("create table " + tableName + " (id integer not null,fn varchar,"
-                    + "cf1.ln varchar constraint pk primary key(id)) split on (1,2,3,4,5)");
+                    + "cf1.ln varchar constraint pk primary key(id)) split on (400,800,1200,1600)");
             statement.execute("create local index " + indexName + " on " + tableName + "  (fn,cf1.ln)");
             statement.execute("create local index " + indexName1 + " on " + tableName + "  (fn)");
-            for (int i = 0; i < 7; i++) {
+            for (int i = 0; i < 2000; i++) {
                 statement.execute("upsert into " + tableName + "  values(" + i + ",'fn" + i + "','ln" + i + "')");
             }
             conn.commit();
             ResultSet rs = statement.executeQuery("SELECT COUNT(*) FROM " + indexName);
             assertTrue(rs.next());
-            assertEquals(7, rs.getLong(1));
+            assertEquals(2000, rs.getLong(1));
             List<HRegionInfo> tableRegions = admin.getTableRegions(TableName.valueOf(tableName));
             admin.disableTable(tableName);
             copyLocalIndexHFiles(config, tableRegions.get(0), tableRegions.get(1), false);
             copyLocalIndexHFiles(config, tableRegions.get(3), tableRegions.get(0), false);
-
             admin.enableTable(tableName);
 
             int count=getCount(conn, tableName, "L#0");
-            assertTrue(count > 14);
-            admin.majorCompact(tableName);
+            assertTrue(count > 4000);
+            admin.majorCompact(TableName.valueOf(tableName));
             int tryCount = 5;// need to wait for rebuilding of corrupted local index region
-            while (tryCount-- > 0 && count != 14) {
-                Thread.sleep(30000);
+            while (tryCount-- > 0 && count != 4000) {
+                Thread.sleep(15000);
                 count = getCount(conn, tableName, "L#0");
             }
-            assertEquals(14, count);
+            assertEquals(4000, count);
             rs = statement.executeQuery("SELECT COUNT(*) FROM " + indexName1);
             assertTrue(rs.next());
-            assertEquals(7, rs.getLong(1));
+            assertEquals(2000, rs.getLong(1));
+            rs = statement.executeQuery("SELECT COUNT(*) FROM " + indexName);
+            assertTrue(rs.next());
+            assertEquals(2000, rs.getLong(1));
+            statement.execute("DROP INDEX " + indexName1 + " ON " + tableName);
+            admin.majorCompact(TableName.valueOf(tableName));
+            statement.execute("DROP INDEX " + indexName + " ON " + tableName);
+            admin.majorCompact(TableName.valueOf(tableName));
+            Thread.sleep(15000);
+            admin.majorCompact(TableName.valueOf(tableName));
+            Thread.sleep(15000);
+            rs = statement.executeQuery("SELECT COUNT(*) FROM " + tableName);
+            assertTrue(rs.next());
+            
         }
+    }
+
+    @Test
+    public void testLocalGlobalIndexMix() throws Exception {
+        if (isNamespaceMapped) { return; }
+        String tableName = generateUniqueName();
+        Connection conn1 = DriverManager.getConnection(getUrl());
+        String ddl = "CREATE TABLE " + tableName + " (t_id VARCHAR NOT NULL,\n" +
+                "k1 INTEGER NOT NULL,\n" +
+                "k2 INTEGER NOT NULL,\n" +
+                "k3 INTEGER,\n" +
+                "v1 VARCHAR,\n" +
+                "v2 VARCHAR,\n" +
+                "CONSTRAINT pk PRIMARY KEY (t_id, k1, k2))\n";
+        conn1.createStatement().execute(ddl);
+        conn1.createStatement().execute("CREATE LOCAL INDEX LV1 ON " + tableName + "(v1)");
+        conn1.createStatement().execute("CREATE INDEX GV2 ON " + tableName + "(v2)");
+
+        conn1.createStatement().execute("UPSERT INTO " + tableName + " values('b',1,2,4,'z','3')");
+        conn1.createStatement().execute("UPSERT INTO " + tableName + " values('f',1,2,3,'a','0')");
+        conn1.createStatement().execute("UPSERT INTO " + tableName + " values('j',2,4,2,'a','2')");
+        conn1.createStatement().execute("UPSERT INTO " + tableName + " values('q',3,1,1,'c','1')");
+        conn1.commit();
+        ResultSet rs = conn1.createStatement().executeQuery("SELECT COUNT(*) FROM " + tableName + " WHERE v1 = 'c'");
+        assertTrue(rs.next());
+        assertEquals(1, rs.getInt(1));
+        rs = conn1.createStatement().executeQuery("SELECT COUNT(*) FROM " + tableName + " WHERE v2 = '2'");
+        assertTrue(rs.next());
+        assertEquals(1, rs.getInt(1));
+        conn1.close();
     }
 
     private void copyLocalIndexHFiles(Configuration conf, HRegionInfo fromRegion, HRegionInfo toRegion, boolean move)
@@ -643,4 +688,74 @@ public class LocalIndexIT extends BaseLocalIndexIT {
     }
 
 
+    @Test
+    public void testLocalIndexForMultiTenantTable() throws Exception {
+        String tableName = schemaName + "." + generateUniqueName();
+        String indexName = "IDX_" + generateUniqueName();
+
+        Connection conn1 = getConnection();
+        try{
+            if (isNamespaceMapped) {
+                conn1.createStatement().execute("CREATE SCHEMA IF NOT EXISTS " + schemaName);
+            }
+            String ddl = "CREATE TABLE " + tableName + " (t_id VARCHAR NOT NULL,\n" +
+                    "k1 INTEGER NOT NULL,\n" +
+                    "v1 VARCHAR,\n" +
+                    "v2 VARCHAR,\n" +
+                    "CONSTRAINT pk PRIMARY KEY (t_id, k1)) MULTI_TENANT=true";
+            conn1.createStatement().execute(ddl);
+            conn1.createStatement().execute("UPSERT INTO " + tableName + " values('b',1,'x','y')");
+            conn1.commit();
+            conn1.createStatement().execute("CREATE LOCAL INDEX " + indexName + " ON " + tableName + "(v1)");
+            
+            ResultSet rs = conn1.createStatement().executeQuery("SELECT * FROM " + tableName + " WHERE v1 = 'x'");
+            assertTrue(rs.next());
+            assertEquals("b", rs.getString("T_ID"));
+            assertEquals("y", rs.getString("V2"));
+            assertFalse(rs.next());
+       } finally {
+            conn1.close();
+        }
+    }
+
+    @Test // See https://issues.apache.org/jira/browse/PHOENIX-4289
+    public void testEstimatesWithLocalIndexes() throws Exception {
+        String tableName = generateUniqueName();
+        String indexName = "IDX_" + generateUniqueName();
+        try (Connection conn = DriverManager.getConnection(getUrl())) {
+            int guidePostWidth = 20;
+            conn.createStatement()
+                    .execute("CREATE TABLE " + tableName
+                            + " (k INTEGER PRIMARY KEY, a bigint, b bigint)"
+                            + " GUIDE_POSTS_WIDTH=" + guidePostWidth);
+            conn.createStatement().execute("upsert into " + tableName + " values (100,1,3)");
+            conn.createStatement().execute("upsert into " + tableName + " values (101,2,4)");
+            conn.createStatement().execute("upsert into " + tableName + " values (102,2,4)");
+            conn.createStatement().execute("upsert into " + tableName + " values (103,2,4)");
+            conn.createStatement().execute("upsert into " + tableName + " values (104,2,4)");
+            conn.createStatement().execute("upsert into " + tableName + " values (105,2,4)");
+            conn.createStatement().execute("upsert into " + tableName + " values (106,2,4)");
+            conn.createStatement().execute("upsert into " + tableName + " values (107,2,4)");
+            conn.createStatement().execute("upsert into " + tableName + " values (108,2,4)");
+            conn.createStatement().execute("upsert into " + tableName + " values (109,2,4)");
+            conn.commit();
+            conn.createStatement().execute(
+                "CREATE LOCAL INDEX " + indexName + " ON " + tableName + " (a) INCLUDE (b) ");
+            String ddl = "ALTER TABLE " + tableName + " SET USE_STATS_FOR_PARALLELIZATION = false";
+            conn.createStatement().execute(ddl);
+            conn.createStatement().execute("UPDATE STATISTICS " + tableName + "");
+        }
+        List<Object> binds = Lists.newArrayList();
+        try (Connection conn = DriverManager.getConnection(getUrl())) {
+            String sql =
+                    "SELECT COUNT(*) " + " FROM " + tableName;
+            ResultSet rs = conn.createStatement().executeQuery(sql);
+            assertTrue("Index " + indexName + " should have been used",
+                rs.unwrap(PhoenixResultSet.class).getStatement().getQueryPlan().getTableRef()
+                        .getTable().getName().getString().equals(indexName));
+            Estimate info = getByteRowEstimates(conn, sql, binds);
+            assertEquals((Long) 10l, info.getEstimatedRows());
+            assertTrue(info.getEstimateInfoTs() > 0);
+        }
+    }
 }

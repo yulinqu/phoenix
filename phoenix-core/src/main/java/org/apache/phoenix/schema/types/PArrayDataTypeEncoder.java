@@ -20,11 +20,19 @@ package org.apache.phoenix.schema.types;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 
+import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.schema.ColumnValueEncoder;
+import org.apache.phoenix.schema.PColumn;
+import org.apache.phoenix.schema.PColumnFamily;
+import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.SortOrder;
 import org.apache.phoenix.util.ByteUtil;
 import org.apache.phoenix.util.TrustedByteArrayOutputStream;
@@ -84,7 +92,9 @@ public class PArrayDataTypeEncoder implements ColumnValueEncoder {
     // used to represent the absence of a value 
     @Override
     public void appendAbsentValue() {
-        if (serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_VERSION && !baseType.isFixedWidth()) {
+        if ((serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_VERSION
+                || serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_V2)
+                && !baseType.isFixedWidth()) {
             offsetPos.add(-byteStream.size());
             nulls++;
         }
@@ -117,7 +127,11 @@ public class PArrayDataTypeEncoder implements ColumnValueEncoder {
                     offsetPos.add(byteStream.size());
                     nulls++;
                 } else {
-                    nulls = PArrayDataType.serializeNulls(oStream, nulls);
+                    // we don't serialize nulls for IMMUTABLE_SERIALIZATION_V2
+                    if (serializationVersion == PArrayDataType.SORTABLE_SERIALIZATION_VERSION
+                            || serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_VERSION) {
+                        nulls = PArrayDataType.serializeNulls(oStream, nulls);
+                    }
                     offsetPos.add(byteStream.size());
                     if (sortOrder == SortOrder.DESC) {
                         SortOrder.invert(bytes, offset, bytes, offset, len);
@@ -145,9 +159,9 @@ public class PArrayDataTypeEncoder implements ColumnValueEncoder {
             if (!baseType.isFixedWidth()) {
                 int noOfElements = offsetPos.size();
                 int[] offsetPosArray = new int[noOfElements];
-                int index = 0;
+                int index = 0, maxOffset = 0;
                 for (Integer i : offsetPos) {
-                    offsetPosArray[index] = i;
+                    maxOffset = offsetPosArray[index] = i;
                     ++index;
                 }
                 if (serializationVersion == PArrayDataType.SORTABLE_SERIALIZATION_VERSION) {
@@ -155,7 +169,7 @@ public class PArrayDataTypeEncoder implements ColumnValueEncoder {
                     PArrayDataType.writeEndSeperatorForVarLengthArray(oStream, sortOrder, rowKeyOrderOptimizable);
                 }
                 noOfElements = PArrayDataType.serializeOffsetArrayIntoStream(oStream, byteStream, noOfElements,
-                        offsetPosArray[offsetPosArray.length - 1], offsetPosArray, serializationVersion);
+                        maxOffset, offsetPosArray, serializationVersion);
                 PArrayDataType.serializeHeaderInfoIntoStream(oStream, noOfElements, serializationVersion);
             }
             ImmutableBytesWritable ptr = new ImmutableBytesWritable();
@@ -165,6 +179,63 @@ public class PArrayDataTypeEncoder implements ColumnValueEncoder {
             close();
         }
         return null;
+    }
+    
+    /**
+     * @param colValueMap map from column to value
+     * @return estimated encoded size
+     */
+    public static int getEstimatedByteSize(PTable table, int rowLength,
+            Map<PColumn, byte[]> colValueMap) {
+        // iterate over column familiies
+        int rowSize = 0;
+        for (PColumnFamily family : table.getColumnFamilies()) {
+            Collection<PColumn> columns = family.getColumns();
+            // we add a non null value to the start so that we can represent absent values in the array with negative offsets
+            int numColumns = columns.size() + 1;
+            int cellSize = 1;
+            int nulls = 0;
+            int maxOffset = 0;
+            // iterate over columns
+            for (PColumn column : columns) {
+                if (colValueMap.containsKey(column)) {
+                    byte[] colValue = colValueMap.get(column);
+                    // the column value is null
+                    if (colValue == null || colValue.length == 0) {
+                        ++nulls;
+                        maxOffset = cellSize;
+                    } else {
+                        // count the bytes written to serialize nulls
+                        if (nulls > 0) {
+                            cellSize += (1 + Math.ceil(nulls / 255));
+                            nulls = 0;
+                        }
+                        maxOffset = cellSize;
+                        cellSize += colValue.length;
+                    }
+                }
+                // the column value is absent
+                else {
+                    ++nulls;
+                    maxOffset = cellSize;
+                }
+            }
+            // count the bytes used for the offset array
+            cellSize +=
+                    PArrayDataType.useShortForOffsetArray(maxOffset,
+                        PArrayDataType.IMMUTABLE_SERIALIZATION_VERSION)
+                                ? numColumns * Bytes.SIZEOF_SHORT
+                                : numColumns * Bytes.SIZEOF_INT;
+            cellSize += 4;
+            // count the bytes used for header information
+            cellSize += 5;
+            // add the size of the single cell containing all column values
+            rowSize +=
+                    KeyValue.getKeyValueDataStructureSize(rowLength,
+                        family.getName().getBytes().length,
+                        QueryConstants.SINGLE_KEYVALUE_COLUMN_QUALIFIER_BYTES.length, cellSize);
+        }
+        return rowSize;
     }
     
 }

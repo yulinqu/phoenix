@@ -21,13 +21,20 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
 
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.Type;
+import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
+import org.apache.phoenix.execute.MutationState.MultiRowMutationState;
+import org.apache.phoenix.execute.MutationState.RowMutationState;
+import org.apache.phoenix.hbase.index.util.ImmutableBytesPtr;
 import org.apache.phoenix.hbase.index.util.KeyValueBuilder;
+import org.apache.phoenix.schema.TableRef;
 
 /**
  * 
@@ -160,4 +167,43 @@ public class KeyValueUtil {
 			return kvBuilder.compareQualifier(l, qualifier, 0, qualifier.length);
 		}
 	}
+
+	/**
+	 * Calculate the size a mutation will likely take when stored in HBase
+	 * @param m The Mutation
+	 * @return the disk size of the passed mutation
+	 */
+    public static long calculateMutationDiskSize(Mutation m) {
+        long size = 0;
+        for (Entry<byte [], List<Cell>> entry : m.getFamilyCellMap().entrySet()) {
+            for (Cell c : entry.getValue()) {
+                size += org.apache.hadoop.hbase.KeyValueUtil.length(c);
+            }
+        }
+        return size;
+    }
+
+    /**
+     * Estimates the size of rows stored in RowMutationState (in memory)
+     * @param mutations map from table to row to RowMutationState
+     * @return estimated row size
+     */
+    public static long
+            getEstimatedRowMutationSize(Map<TableRef, MultiRowMutationState> tableMutationMap) {
+        long size = 0;
+        // iterate over table
+        for (Entry<TableRef, MultiRowMutationState> tableEntry : tableMutationMap.entrySet()) {
+            // iterate over rows
+            for (Entry<ImmutableBytesPtr, RowMutationState> rowEntry : tableEntry.getValue().entrySet()) {
+                size += calculateRowMutationSize(rowEntry);
+            }
+        }
+        return size;
+    }
+
+    private static long calculateRowMutationSize(Entry<ImmutableBytesPtr, RowMutationState> rowEntry) {
+        int rowLength = rowEntry.getKey().getLength();
+        long colValuesLength = rowEntry.getValue().calculateEstimatedSize();
+        return (rowLength + colValuesLength);
+    }
 }

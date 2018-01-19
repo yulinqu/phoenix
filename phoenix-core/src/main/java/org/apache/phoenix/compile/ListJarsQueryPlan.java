@@ -49,6 +49,7 @@ import org.apache.phoenix.iterate.ResultIterator;
 import org.apache.phoenix.jdbc.PhoenixParameterMetaData;
 import org.apache.phoenix.jdbc.PhoenixStatement;
 import org.apache.phoenix.jdbc.PhoenixStatement.Operation;
+import org.apache.phoenix.optimize.Cost;
 import org.apache.phoenix.parse.FilterableStatement;
 import org.apache.phoenix.parse.LiteralParseNode;
 import org.apache.phoenix.parse.ParseNodeFactory;
@@ -66,6 +67,7 @@ import org.apache.phoenix.schema.tuple.ResultTuple;
 import org.apache.phoenix.schema.tuple.Tuple;
 import org.apache.phoenix.schema.types.PVarchar;
 import org.apache.phoenix.util.ByteUtil;
+import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.apache.phoenix.util.SizedUtil;
 
 public class ListJarsQueryPlan implements QueryPlan {
@@ -82,7 +84,7 @@ public class ListJarsQueryPlan implements QueryPlan {
         PColumn column =
                 new PColumnImpl(colName, null,
                         PVarchar.INSTANCE, null, null, false, 0, SortOrder.getDefault(), 0, null,
-                        false, null, false, false, colName.getBytes());
+                        false, null, false, false, colName.getBytes(), HConstants.LATEST_TIMESTAMP);
         List<PColumn> columns = new ArrayList<PColumn>();
         columns.add(column);
         Expression expression =
@@ -163,7 +165,7 @@ public class ListJarsQueryPlan implements QueryPlan {
                     byte[] rowKey = ByteUtil.copyKeyBytesIfNecessary(ptr);
                     Cell cell =
                             CellUtil.createCell(rowKey, HConstants.EMPTY_BYTE_ARRAY,
-                                HConstants.EMPTY_BYTE_ARRAY, System.currentTimeMillis(),
+                                HConstants.EMPTY_BYTE_ARRAY, EnvironmentEdgeManager.currentTimeMillis(),
                                 Type.Put.getCode(), HConstants.EMPTY_BYTE_ARRAY);
                     List<Cell> cells = new ArrayList<Cell>(1);
                     cells.add(cell);
@@ -182,6 +184,11 @@ public class ListJarsQueryPlan implements QueryPlan {
     @Override
     public long getEstimatedSize() {
         return PVarchar.INSTANCE.getByteSize();
+    }
+
+    @Override
+    public Cost getCost() {
+        return Cost.ZERO;
     }
 
     @Override
@@ -253,4 +260,19 @@ public class ListJarsQueryPlan implements QueryPlan {
 	public Operation getOperation() {
 		return stmt.getUpdateOperation();
 	}
+
+    @Override
+    public Long getEstimatedRowsToScan() {
+        return 0l;
+    }
+
+    @Override
+    public Long getEstimatedBytesToScan() {
+        return 0l;
+    }
+
+    @Override
+    public Long getEstimateInfoTimestamp() throws SQLException {
+        return 0l;
+    }
 }

@@ -25,12 +25,16 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.apache.hadoop.hbase.DoNotRetryIOException;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.NotServingRegionException;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.HTableInterface;
 import org.apache.hadoop.hbase.client.HTablePool;
 import org.apache.hadoop.hbase.client.RetriesExhaustedWithDetailsException;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
+import org.apache.hadoop.hbase.regionserver.Region;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.phoenix.coprocessor.HashJoinCacheNotFoundException;
 import org.apache.phoenix.exception.PhoenixIOException;
 import org.apache.phoenix.exception.SQLExceptionCode;
 import org.apache.phoenix.exception.SQLExceptionInfo;
@@ -44,6 +48,9 @@ public class ServerUtil {
     
     private static final String FORMAT = "ERROR %d (%s): %s";
     private static final Pattern PATTERN = Pattern.compile("ERROR (\\d+) \\((\\w+)\\): (.*)");
+    private static final Pattern HASH_JOIN_EXCEPTION_PATTERN = Pattern.compile("joinId: (-?\\d+)");
+    private static final Pattern PATTERN_FOR_TS = Pattern.compile(",serverTimestamp=(\\d+),");
+    private static final String FORMAT_FOR_TIMESTAMP = ",serverTimestamp=%d,";
     private static final Map<Class<? extends Exception>, SQLExceptionCode> errorcodeMap
         = new HashMap<Class<? extends Exception>, SQLExceptionCode>();
     static {
@@ -124,6 +131,7 @@ public class ServerUtil {
     }
 
     private static SQLException parseRemoteException(Throwable t) {
+        
         String message = t.getLocalizedMessage();
         if (message != null) {
             // If the message matches the standard pattern, recover the SQLException and throw it.
@@ -131,6 +139,10 @@ public class ServerUtil {
             if (matcher.find()) {
                 int statusCode = Integer.parseInt(matcher.group(1));
                 SQLExceptionCode code = SQLExceptionCode.fromErrorCode(statusCode);
+                if(code.equals(SQLExceptionCode.HASH_JOIN_CACHE_NOT_FOUND)){
+                    Matcher m = HASH_JOIN_EXCEPTION_PATTERN.matcher(t.getLocalizedMessage());
+                    if (m.find()) { return new HashJoinCacheNotFoundException(Long.parseLong(m.group(1))); }
+                }
                 return new SQLExceptionInfo.Builder(code).setMessage(matcher.group()).setRootCause(t).build().buildException();
             }
         }
@@ -176,4 +188,51 @@ public class ServerUtil {
         }
         return getTableFromSingletonPool(env, tableName);
     }
+    
+    public static long parseServerTimestamp(Throwable t) {
+        while (t.getCause() != null) {
+            t = t.getCause();
+        }
+        return parseTimestampFromRemoteException(t);
+    }
+
+    private static long parseTimestampFromRemoteException(Throwable t) {
+        String message = t.getLocalizedMessage();
+        if (message != null) {
+            // If the message matches the standard pattern, recover the SQLException and throw it.
+            Matcher matcher = PATTERN_FOR_TS.matcher(t.getLocalizedMessage());
+            if (matcher.find()) {
+                String tsString = matcher.group(1);
+                if (tsString != null) {
+                    return Long.parseLong(tsString);
+                }
+            }
+        }
+        return HConstants.LATEST_TIMESTAMP;
+    }
+
+    public static DoNotRetryIOException wrapInDoNotRetryIOException(String msg, Throwable t, long timestamp) {
+        if (msg == null) {
+            msg = "";
+        }
+        if (t instanceof SQLException) {
+            msg = constructSQLErrorMessage((SQLException) t, msg);
+        }
+        msg += String.format(FORMAT_FOR_TIMESTAMP, timestamp);
+        return new DoNotRetryIOException(msg, t);
+    }
+    
+    public static boolean readyToCommit(int rowCount, long mutationSize, int maxBatchSize, long maxBatchSizeBytes) {
+        return maxBatchSize > 0 && rowCount >= maxBatchSize
+                || (maxBatchSizeBytes > 0 && mutationSize >= maxBatchSizeBytes);
+    }
+    
+    public static boolean isKeyInRegion(byte[] key, Region region) {
+        byte[] startKey = region.getRegionInfo().getStartKey();
+        byte[] endKey = region.getRegionInfo().getEndKey();
+        return (Bytes.compareTo(startKey, key) <= 0
+                && (Bytes.compareTo(HConstants.LAST_ROW, endKey) == 0 || Bytes.compareTo(key,
+                    endKey) < 0));
+    }
+
 }

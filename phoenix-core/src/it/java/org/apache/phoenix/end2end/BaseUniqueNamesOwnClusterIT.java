@@ -18,7 +18,6 @@
 package org.apache.phoenix.end2end;
 
 import org.apache.phoenix.query.BaseTest;
-import org.junit.AfterClass;
 import org.junit.experimental.categories.Category;
 
 /**
@@ -31,8 +30,4 @@ import org.junit.experimental.categories.Category;
  */
 @Category(NeedsOwnMiniClusterTest.class)
 public class BaseUniqueNamesOwnClusterIT extends BaseTest {
-    @AfterClass
-    public static void doTeardown() throws Exception {
-        tearDownMiniCluster();
-    }
 }

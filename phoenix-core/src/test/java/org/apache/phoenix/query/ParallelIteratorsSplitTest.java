@@ -52,6 +52,7 @@ import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.jdbc.PhoenixParameterMetaData;
 import org.apache.phoenix.jdbc.PhoenixStatement;
 import org.apache.phoenix.jdbc.PhoenixStatement.Operation;
+import org.apache.phoenix.optimize.Cost;
 import org.apache.phoenix.parse.FilterableStatement;
 import org.apache.phoenix.parse.PFunction;
 import org.apache.phoenix.parse.PSchema;
@@ -471,8 +472,28 @@ public class ParallelIteratorsSplitTest extends BaseConnectionlessQueryTest {
             public boolean useRoundRobinIterator() {
                 return false;
             }
+
+            @Override
+            public Long getEstimatedRowsToScan() {
+                return null;
+            }
+
+            @Override
+            public Long getEstimatedBytesToScan() {
+                return null;
+            }
+
+            @Override
+            public Long getEstimateInfoTimestamp() throws SQLException {
+                return null;
+            }
+
+            @Override
+            public Cost getCost() {
+                return Cost.ZERO;
+            }
             
-        }, null, new SpoolingResultIterator.SpoolingResultIteratorFactory(context.getConnection().getQueryServices()), context.getScan(), false);
+        }, null, new SpoolingResultIterator.SpoolingResultIteratorFactory(context.getConnection().getQueryServices()), context.getScan(), false, null);
         List<KeyRange> keyRanges = parallelIterators.getSplits();
         return keyRanges;
     }

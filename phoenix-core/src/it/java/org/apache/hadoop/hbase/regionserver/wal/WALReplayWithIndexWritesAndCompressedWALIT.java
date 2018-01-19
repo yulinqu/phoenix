@@ -46,8 +46,8 @@ import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.regionserver.HRegion;
+import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.regionserver.RegionServerAccounting;
-import org.apache.hadoop.hbase.regionserver.RegionServerServices;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.wal.WAL;
@@ -56,10 +56,11 @@ import org.apache.hadoop.hbase.wal.WALSplitter;
 import org.apache.phoenix.end2end.NeedsOwnMiniClusterTest;
 import org.apache.phoenix.hbase.index.IndexTestingUtils;
 import org.apache.phoenix.hbase.index.TableName;
-import org.apache.phoenix.hbase.index.covered.example.ColumnGroup;
-import org.apache.phoenix.hbase.index.covered.example.CoveredColumn;
-import org.apache.phoenix.hbase.index.covered.example.CoveredColumnIndexSpecifierBuilder;
-import org.apache.phoenix.hbase.index.covered.example.CoveredColumnIndexer;
+import org.apache.phoenix.hbase.index.covered.ColumnGroup;
+import org.apache.phoenix.hbase.index.covered.CoveredColumn;
+import org.apache.phoenix.hbase.index.covered.CoveredColumnIndexSpecifierBuilder;
+import org.apache.phoenix.hbase.index.util.TestIndexManagementUtil;
+import org.apache.phoenix.query.QueryServices;
 import org.apache.phoenix.util.ConfigUtil;
 import org.junit.After;
 import org.junit.Before;
@@ -100,6 +101,7 @@ public class WALReplayWithIndexWritesAndCompressedWALIT {
     setupCluster();
     Path hbaseRootDir = UTIL.getDataTestDir();
     this.conf = HBaseConfiguration.create(UTIL.getConfiguration());
+    this.conf.setBoolean(QueryServices.INDEX_FAILURE_THROW_EXCEPTION_ATTRIB, false);
     this.fs = UTIL.getDFSCluster().getFileSystem();
     this.hbaseRootDir = new Path(this.conf.get(HConstants.HBASE_DIR));
     this.oldLogDir = new Path(this.hbaseRootDir, HConstants.HREGION_OLDLOGDIR_NAME);
@@ -192,7 +194,7 @@ public class WALReplayWithIndexWritesAndCompressedWALIT {
     WALFactory walFactory = new WALFactory(this.conf, null, "localhost,1234");
 
     WAL wal = createWAL(this.conf, walFactory);
-    RegionServerServices mockRS = Mockito.mock(RegionServerServices.class);
+    HRegionServer mockRS = Mockito.mock(HRegionServer.class);
     // mock out some of the internals of the RSS, so we can run CPs
     when(mockRS.getWAL(null)).thenReturn(wal);
     RegionServerAccounting rsa = Mockito.mock(RegionServerAccounting.class);
@@ -216,7 +218,7 @@ public class WALReplayWithIndexWritesAndCompressedWALIT {
       Mockito.any(Exception.class));
 
     // then create the index table so we are successful on WAL replay
-    CoveredColumnIndexer.createIndexTable(UTIL.getHBaseAdmin(), INDEX_TABLE_NAME);
+    TestIndexManagementUtil.createIndexTable(UTIL.getHBaseAdmin(), INDEX_TABLE_NAME);
 
     // run the WAL split and setup the region
     runWALSplit(this.conf, walFactory);
@@ -264,7 +266,7 @@ public class WALReplayWithIndexWritesAndCompressedWALIT {
    * @throws IOException
    */
   private WAL createWAL(final Configuration c, WALFactory walFactory) throws IOException {
-    WAL wal = walFactory.getWAL(new byte[]{});
+    WAL wal = walFactory.getWAL(new byte[]{}, null);
 
     // Set down maximum recovery so we dfsclient doesn't linger retrying something
     // long gone.

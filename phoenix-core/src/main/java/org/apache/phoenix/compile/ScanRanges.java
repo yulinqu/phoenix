@@ -41,14 +41,16 @@ import org.apache.phoenix.schema.RowKeySchema;
 import org.apache.phoenix.schema.SaltingUtil;
 import org.apache.phoenix.schema.SortOrder;
 import org.apache.phoenix.schema.ValueSchema.Field;
+import org.apache.phoenix.schema.types.PDataType.PDataCodec;
+import org.apache.phoenix.schema.types.PLong;
 import org.apache.phoenix.util.ByteUtil;
+import org.apache.phoenix.util.DateUtil;
 import org.apache.phoenix.util.ScanUtil;
 import org.apache.phoenix.util.ScanUtil.BytesComparator;
 import org.apache.phoenix.util.SchemaUtil;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Iterators;
 import com.google.common.collect.Lists;
 
 
@@ -205,13 +207,18 @@ public class ScanRanges {
     }
     
     public static byte[] prefixKey(byte[] key, int keyOffset, byte[] prefixKey, int prefixKeyOffset) {
-        if (key.length > 0) {
-            byte[] newKey = new byte[key.length + prefixKeyOffset];
+        return prefixKey(key, keyOffset, key.length, prefixKey, prefixKeyOffset);
+    }
+
+    public static byte[] prefixKey(byte[] key, int keyOffset, int keyLength, byte[] prefixKey,
+            int prefixKeyOffset) {
+        if (keyLength > 0) {
+            byte[] newKey = new byte[keyLength + prefixKeyOffset];
             int totalKeyOffset = keyOffset + prefixKeyOffset;
             if (prefixKey.length >= totalKeyOffset) { // otherwise it's null padded
                 System.arraycopy(prefixKey, 0, newKey, 0, totalKeyOffset);
             }
-            System.arraycopy(key, keyOffset, newKey, totalKeyOffset, key.length - keyOffset);
+            System.arraycopy(key, keyOffset, newKey, totalKeyOffset, keyLength - keyOffset);
             return newKey;
         } 
         return key;
@@ -563,7 +570,7 @@ public class ScanRanges {
     }
     
     public Iterator<KeyRange> getPointLookupKeyIterator() {
-        return isPointLookup ? ranges.get(0).iterator() : Iterators.<KeyRange>emptyIterator();
+        return isPointLookup ? ranges.get(0).iterator() : Collections.<KeyRange>emptyIterator();
     }
 
     public int getBoundPkColumnCount() {
@@ -650,8 +657,8 @@ public class ScanRanges {
                     //ranges.set(rowTimestampColPos, sortedRange); //TODO: do I really need to do this?
                     Field f = schema.getField(rowTimestampColPos);
                     SortOrder order = f.getSortOrder();
-                    KeyRange lowestRange = rowTimestampColRange.get(0);
-                    KeyRange highestRange = rowTimestampColRange.get(rowTimestampColRange.size() - 1);
+                    KeyRange lowestRange = sortedRange.get(0);
+                    KeyRange highestRange = sortedRange.get(rowTimestampColRange.size() - 1);
                     if (order == SortOrder.DESC) {
                         return getDescTimeRange(lowestRange, highestRange, f);
                     }
@@ -668,16 +675,17 @@ public class ScanRanges {
             throws IOException {
         long low;
         long high;
+        PDataCodec codec = PLong.INSTANCE.getCodec();
         if (lowestRange.lowerUnbound()) {
             low = 0;
         } else {
-            long lowerRange = f.getDataType().getCodec().decodeLong(lowestRange.getLowerRange(), 0, SortOrder.ASC);
+            long lowerRange = codec.decodeLong(lowestRange.getLowerRange(), 0, SortOrder.ASC);
             low = lowestRange.isLowerInclusive() ? lowerRange : safelyIncrement(lowerRange);
         }
         if (highestRange.upperUnbound()) {
             high = HConstants.LATEST_TIMESTAMP;
         } else {
-            long upperRange = f.getDataType().getCodec().decodeLong(highestRange.getUpperRange(), 0, SortOrder.ASC);
+            long upperRange = codec.decodeLong(highestRange.getUpperRange(), 0, SortOrder.ASC);
             if (highestRange.isUpperInclusive()) {
                 high = safelyIncrement(upperRange);
             } else {
@@ -692,9 +700,9 @@ public class ScanRanges {
         boolean lowerInclusive = lowestKeyRange.isLowerInclusive();
         boolean upperUnbound = highestKeyRange.upperUnbound();
         boolean upperInclusive = highestKeyRange.isUpperInclusive();
-
-        long low = lowerUnbound ? -1 : f.getDataType().getCodec().decodeLong(lowestKeyRange.getLowerRange(), 0, SortOrder.DESC);
-        long high = upperUnbound ? -1 : f.getDataType().getCodec().decodeLong(highestKeyRange.getUpperRange(), 0, SortOrder.DESC);
+        PDataCodec codec = PLong.INSTANCE.getCodec();
+        long low = lowerUnbound ? -1 : codec.decodeLong(lowestKeyRange.getLowerRange(), 0, SortOrder.DESC);
+        long high = upperUnbound ? -1 : codec.decodeLong(highestKeyRange.getUpperRange(), 0, SortOrder.DESC);
         long newHigh;
         long newLow;
         if (!lowerUnbound && !upperUnbound) {

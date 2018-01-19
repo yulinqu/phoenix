@@ -46,6 +46,7 @@ import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.jdbc.PhoenixStatement;
 import org.apache.phoenix.jdbc.PhoenixStatement.Operation;
 import org.apache.phoenix.metrics.MetricInfo;
+import org.apache.phoenix.optimize.Cost;
 import org.apache.phoenix.parse.FilterableStatement;
 import org.apache.phoenix.parse.LiteralParseNode;
 import org.apache.phoenix.parse.ParseNodeFactory;
@@ -63,6 +64,7 @@ import org.apache.phoenix.schema.tuple.Tuple;
 import org.apache.phoenix.schema.types.PLong;
 import org.apache.phoenix.trace.util.Tracing;
 import org.apache.phoenix.util.ByteUtil;
+import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.apache.phoenix.util.SizedUtil;
 
 public class TraceQueryPlan implements QueryPlan {
@@ -79,7 +81,7 @@ public class TraceQueryPlan implements QueryPlan {
         PColumn column =
                 new PColumnImpl(PNameFactory.newName(MetricInfo.TRACE.columnName), null,
                         PLong.INSTANCE, null, null, false, 0, SortOrder.getDefault(), 0, null,
-                        false, null, false, false, colName.getBytes());
+                        false, null, false, false, colName.getBytes(), HConstants.LATEST_TIMESTAMP);
         List<PColumn> columns = new ArrayList<PColumn>();
         columns.add(column);
         Expression expression =
@@ -167,7 +169,7 @@ public class TraceQueryPlan implements QueryPlan {
                 byte[] rowKey = ByteUtil.copyKeyBytesIfNecessary(ptr);
                 Cell cell =
                         CellUtil.createCell(rowKey, HConstants.EMPTY_BYTE_ARRAY,
-                            HConstants.EMPTY_BYTE_ARRAY, System.currentTimeMillis(),
+                            HConstants.EMPTY_BYTE_ARRAY, EnvironmentEdgeManager.currentTimeMillis(),
                             Type.Put.getCode(), HConstants.EMPTY_BYTE_ARRAY);
                 List<Cell> cells = new ArrayList<Cell>(1);
                 cells.add(cell);
@@ -190,6 +192,11 @@ public class TraceQueryPlan implements QueryPlan {
     @Override
     public long getEstimatedSize() {
         return PLong.INSTANCE.getByteSize();
+    }
+
+    @Override
+    public Cost getCost() {
+        return Cost.ZERO;
     }
 
     @Override
@@ -260,5 +267,20 @@ public class TraceQueryPlan implements QueryPlan {
     @Override
     public boolean useRoundRobinIterator() {
         return false;
+    }
+
+    @Override
+    public Long getEstimatedRowsToScan() {
+        return 0l;
+    }
+
+    @Override
+    public Long getEstimatedBytesToScan() {
+        return 0l;
+    }
+
+    @Override
+    public Long getEstimateInfoTimestamp() throws SQLException {
+        return 0l;
     }
 }

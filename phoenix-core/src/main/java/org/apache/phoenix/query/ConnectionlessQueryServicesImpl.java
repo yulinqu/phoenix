@@ -80,15 +80,13 @@ import org.apache.phoenix.schema.TableAlreadyExistsException;
 import org.apache.phoenix.schema.TableNotFoundException;
 import org.apache.phoenix.schema.stats.GuidePostsInfo;
 import org.apache.phoenix.schema.stats.GuidePostsKey;
+import org.apache.phoenix.transaction.TransactionFactory;
 import org.apache.phoenix.util.JDBCUtil;
 import org.apache.phoenix.util.MetaDataUtil;
 import org.apache.phoenix.util.PhoenixRuntime;
 import org.apache.phoenix.util.PropertiesUtil;
 import org.apache.phoenix.util.SchemaUtil;
 import org.apache.phoenix.util.SequenceUtil;
-import org.apache.tephra.TransactionManager;
-import org.apache.tephra.TransactionSystemClient;
-import org.apache.tephra.inmemory.InMemoryTxSystemClient;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -107,7 +105,6 @@ public class ConnectionlessQueryServicesImpl extends DelegateQueryServices imple
     private PMetaData metaData;
     private final Map<SequenceKey, SequenceInfo> sequenceMap = Maps.newHashMap();
     private final String userName;
-    private final TransactionSystemClient txSystemClient;
     private KeyValueBuilder kvBuilder;
     private volatile boolean initialized;
     private volatile SQLException initializationException;
@@ -119,7 +116,7 @@ public class ConnectionlessQueryServicesImpl extends DelegateQueryServices imple
         super(services);
         userName = connInfo.getPrincipal();
         metaData = newEmptyMetaData();
-        
+
         // Use KeyValueBuilder that builds real KeyValues, as our test utils require this
         this.kvBuilder = GenericKeyValueBuilder.INSTANCE;
         Configuration config = HBaseFactoryProvider.getConfigurationFactory().getConfiguration();
@@ -138,8 +135,6 @@ public class ConnectionlessQueryServicesImpl extends DelegateQueryServices imple
         // Without making a copy of the configuration we cons up, we lose some of our properties
         // on the server side during testing.
         this.config = HBaseFactoryProvider.getConfigurationFactory().getConfiguration(config);
-        TransactionManager txnManager = new TransactionManager(config);
-        this.txSystemClient = new InMemoryTxSystemClient(txnManager);
         this.guidePostsCache = new GuidePostsCache(this, config);
     }
 
@@ -298,6 +293,7 @@ public class ConnectionlessQueryServicesImpl extends DelegateQueryServices imple
                 scnProps.remove(PhoenixRuntime.TENANT_ID_ATTRIB);
                 String globalUrl = JDBCUtil.removeProperty(url, PhoenixRuntime.TENANT_ID_ATTRIB);
                 metaConnection = new PhoenixConnection(this, globalUrl, scnProps, newEmptyMetaData());
+                metaConnection.setRunningUpgrade(true);
                 try {
                     metaConnection.createStatement().executeUpdate(QueryConstants.CREATE_TABLE_METADATA);
                 } catch (TableAlreadyExistsException ignore) {
@@ -325,6 +321,11 @@ public class ConnectionlessQueryServicesImpl extends DelegateQueryServices imple
                    metaConnection.createStatement().executeUpdate(QueryConstants.CREATE_FUNCTION_METADATA);
                 } catch (NewerTableAlreadyExistsException ignore) {
                 }
+                
+                try {
+                    metaConnection.createStatement().executeUpdate(QueryConstants.CREATE_CHILD_LINK_METADATA);
+                 } catch (NewerTableAlreadyExistsException ignore) {
+                 }
             } catch (SQLException e) {
                 sqlE = e;
             } finally {
@@ -352,7 +353,7 @@ public class ConnectionlessQueryServicesImpl extends DelegateQueryServices imple
 
     @Override
     public MutationState updateData(MutationPlan plan) throws SQLException {
-        return new MutationState(0, plan.getContext().getConnection());
+        return new MutationState(0, 0, plan.getContext().getConnection());
     }
 
     @Override
@@ -383,6 +384,13 @@ public class ConnectionlessQueryServicesImpl extends DelegateQueryServices imple
         PTable index = metaData.getTableRef(new PTableKey(tenantId, indexTableName)).getTable();
         index = PTableImpl.makePTable(index,newState == PIndexState.USABLE ? PIndexState.ACTIVE : newState == PIndexState.UNUSABLE ? PIndexState.INACTIVE : newState);
         return new MetaDataMutationResult(MutationCode.TABLE_ALREADY_EXISTS, 0, index);
+    }
+
+    @Override
+    public MetaDataMutationResult updateIndexState(List<Mutation> tableMetadata,
+            String parentTableName, Map<String, List<Pair<String, Object>>> stmtProperties,
+            PTable table) throws SQLException {
+        return updateIndexState(tableMetadata,parentTableName);
     }
 
     @Override
@@ -531,11 +539,6 @@ public class ConnectionlessQueryServicesImpl extends DelegateQueryServices imple
                 QueryServicesOptions.DEFAULT_SEQUENCE_TABLE_SALT_BUCKETS);
     }
 
-    @Override
-    public TransactionSystemClient getTransactionSystemClient() {
-        return txSystemClient;
-    }
- 
     public MetaDataMutationResult createFunction(List<Mutation> functionData, PFunction function, boolean temporary)
             throws SQLException {
         return new MetaDataMutationResult(MutationCode.FUNCTION_NOT_FOUND, 0l, null);

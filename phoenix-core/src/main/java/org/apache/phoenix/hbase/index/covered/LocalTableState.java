@@ -18,7 +18,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.KeyValueUtil;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
 import org.apache.hadoop.hbase.util.Pair;
@@ -28,8 +30,8 @@ import org.apache.phoenix.hbase.index.covered.data.LocalHBaseState;
 import org.apache.phoenix.hbase.index.covered.update.ColumnReference;
 import org.apache.phoenix.hbase.index.covered.update.ColumnTracker;
 import org.apache.phoenix.hbase.index.covered.update.IndexedColumnGroup;
-import org.apache.phoenix.hbase.index.scanner.Scanner;
 import org.apache.phoenix.hbase.index.scanner.ScannerBuilder;
+import org.apache.phoenix.hbase.index.scanner.ScannerBuilder.CoveredDeleteScanner;
 import org.apache.phoenix.hbase.index.util.IndexManagementUtil;
 
 /**
@@ -84,6 +86,24 @@ public class LocalTableState implements TableState {
         }
     }
 
+    private void addUpdateCells(List<Cell> list, boolean overwrite) {
+        if (list == null) return;
+        // Avoid a copy of the Cell into a KeyValue if it's already a KeyValue
+        for (Cell c : list) {
+            this.memstore.add(maybeCopyCell(c), overwrite);
+        }
+    }
+
+    private KeyValue maybeCopyCell(Cell c) {
+        // Same as KeyValueUtil, but HBase has deprecated this method. Avoid depending on something
+        // that will likely be removed at some point in time.
+        if (c == null) return null;
+        if (c instanceof KeyValue) {
+            return (KeyValue) c;
+        }
+        return KeyValueUtil.copyToNewKeyValue(c);
+    }
+
     @Override
     public RegionCoprocessorEnvironment getEnvironment() {
         return this.env;
@@ -136,15 +156,35 @@ public class LocalTableState implements TableState {
      * @param ignoreNewerMutations ignore mutations newer than m when determining current state. Useful
      *        when replaying mutation state for partial index rebuild where writes succeeded to the data
      *        table, but not to the index table.
+     * @param indexMetaData TODO
      * @return an iterator over the columns and the {@link IndexUpdate} that should be passed back to
      *         the builder. Even if no update is necessary for the requested columns, you still need
      *         to return the {@link IndexUpdate}, just don't set the update for the
      *         {@link IndexUpdate}.
      * @throws IOException
      */
-    public Pair<Scanner, IndexUpdate> getIndexedColumnsTableState(
-        Collection<? extends ColumnReference> indexedColumns, boolean ignoreNewerMutations, boolean returnNullScannerIfRowNotFound) throws IOException {
-        ensureLocalStateInitialized(indexedColumns, ignoreNewerMutations);
+    public Pair<CoveredDeleteScanner, IndexUpdate> getIndexedColumnsTableState(
+        Collection<? extends ColumnReference> indexedColumns, boolean ignoreNewerMutations, boolean isStateForDeletes, IndexMetaData indexMetaData) throws IOException {
+        // check to see if we haven't initialized any columns yet
+        Collection<? extends ColumnReference> toCover = this.columnSet.findNonCoveredColumns(indexedColumns);
+        
+        // add the covered columns to the set
+        for (ColumnReference ref : toCover) {
+            this.columnSet.addColumn(ref);
+        }
+        boolean requiresPriorRowState = indexMetaData.requiresPriorRowState(update);
+        if (!toCover.isEmpty()) {
+            // no need to perform scan to find prior row values when the indexed columns are immutable, as
+            // by definition, there won't be any. If we have indexed non row key columns, then we need to
+            // look up the row so that we can formulate the delete of the index row correctly. We'll always
+            // have our "empty" key value column, so we check if we have more than that as a basis for
+            // needing to lookup the prior row values.
+            if (requiresPriorRowState) {
+                // add the current state of the row. Uses listCells() to avoid a new array creation.
+                this.addUpdateCells(this.table.getCurrentRowState(update, toCover, ignoreNewerMutations).listCells(), false);
+            }
+        }
+
         // filter out things with a newer timestamp and track the column references to which it applies
         ColumnTracker tracker = new ColumnTracker(indexedColumns);
         synchronized (this.trackedColumns) {
@@ -154,30 +194,27 @@ public class LocalTableState implements TableState {
             }
         }
 
-        Scanner scanner = this.scannerBuilder.buildIndexedColumnScanner(indexedColumns, tracker, ts, returnNullScannerIfRowNotFound);
-
-        return new Pair<Scanner, IndexUpdate>(scanner, new IndexUpdate(tracker));
+        CoveredDeleteScanner scanner = this.scannerBuilder.buildIndexedColumnScanner(indexedColumns, tracker, ts,
+                // If we're determining the index state for deletes and either
+                // a) we've looked up the prior row state or
+                // b) we're inserting immutable data
+                // then allow a null scanner to be returned.
+                // FIXME: this is crappy code - we need to simplify the global mutable secondary index implementation
+                // TODO: use mutable transactional secondary index implementation instead (PhoenixTransactionalIndexer)
+                isStateForDeletes && (requiresPriorRowState || insertingData(update)));
+        return new Pair<CoveredDeleteScanner, IndexUpdate>(scanner, new IndexUpdate(tracker));
     }
 
-    /**
-     * Initialize the managed local state. Generally, this will only be called by
-     * {@link #getNonIndexedColumnsTableState(List)}, which is unlikely to be called concurrently from the outside. Even
-     * then, there is still fairly low contention as each new Put/Delete will have its own table state.
-     */
-    private synchronized void ensureLocalStateInitialized(Collection<? extends ColumnReference> columns, boolean ignoreNewerMutations)
-            throws IOException {
-        // check to see if we haven't initialized any columns yet
-        Collection<? extends ColumnReference> toCover = this.columnSet.findNonCoveredColumns(columns);
-        // we have all the columns loaded, so we are good to go.
-        if (toCover.isEmpty()) { return; }
-
-        // add the current state of the row
-        this.addUpdate(this.table.getCurrentRowState(update, toCover, ignoreNewerMutations).list(), false);
-
-        // add the covered columns to the set
-        for (ColumnReference ref : toCover) {
-            this.columnSet.addColumn(ref);
+ 
+    private static boolean insertingData(Mutation m) {
+        for (Collection<Cell> cells : m.getFamilyCellMap().values()) {
+            for (Cell cell : cells) {
+                if (KeyValue.Type.codeToType(cell.getTypeByte()) != KeyValue.Type.Put) {
+                    return false;
+                }
+            }
         }
+        return true;
     }
 
     @Override
@@ -238,9 +275,9 @@ public class LocalTableState implements TableState {
     }
 
     @Override
-    public Pair<ValueGetter, IndexUpdate> getIndexUpdateState(Collection<? extends ColumnReference> indexedColumns, boolean ignoreNewerMutations, boolean returnNullScannerIfRowNotFound)
+    public Pair<ValueGetter, IndexUpdate> getIndexUpdateState(Collection<? extends ColumnReference> indexedColumns, boolean ignoreNewerMutations, boolean isStateForDeletes, IndexMetaData indexMetaData)
             throws IOException {
-        Pair<Scanner, IndexUpdate> pair = getIndexedColumnsTableState(indexedColumns, ignoreNewerMutations, returnNullScannerIfRowNotFound);
+        Pair<CoveredDeleteScanner, IndexUpdate> pair = getIndexedColumnsTableState(indexedColumns, ignoreNewerMutations, isStateForDeletes, indexMetaData);
         ValueGetter valueGetter = IndexManagementUtil.createGetterFromScanner(pair.getFirst(), getCurrentRowKey());
         return new Pair<ValueGetter, IndexUpdate>(valueGetter, pair.getSecond());
     }

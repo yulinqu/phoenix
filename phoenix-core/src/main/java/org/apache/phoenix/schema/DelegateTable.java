@@ -310,4 +310,9 @@ public class DelegateTable implements PTable {
     public QualifierEncodingScheme getEncodingScheme() {
         return delegate.getEncodingScheme();
     }
+
+    @Override
+    public Boolean useStatsForParallelization() {
+        return delegate.useStatsForParallelization();
+    }
 }

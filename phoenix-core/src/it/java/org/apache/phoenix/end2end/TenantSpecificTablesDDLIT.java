@@ -471,7 +471,6 @@ public class TenantSpecificTablesDDLIT extends BaseTenantSpecificTablesIT {
             assertEquals(tenantTable2, rs.getString(PhoenixDatabaseMetaData.TABLE_NAME));
             assertEquals(PARENT_TABLE_NAME, rs.getString(PhoenixDatabaseMetaData.SUPERTABLE_NAME));
             assertFalse(rs.next());
-            conn.close();
             
             Set<String> sortedCatalogs = new HashSet<>(Arrays.asList(TENANT_ID, tenantId2));
             rs = conn.getMetaData().getCatalogs();
@@ -491,6 +490,8 @@ public class TenantSpecificTablesDDLIT extends BaseTenantSpecificTablesIT {
             ResultSet rs = meta.getTables("", SYSTEM_CATALOG_SCHEMA, null, new String[] {PTableType.SYSTEM.getValue().getString()});
             assertTrue(rs.next());
             assertTableMetaData(rs, PhoenixDatabaseMetaData.SYSTEM_CATALOG_SCHEMA, PhoenixDatabaseMetaData.SYSTEM_CATALOG_TABLE, PTableType.SYSTEM);
+            assertTrue(rs.next());
+            assertTableMetaData(rs, PhoenixDatabaseMetaData.SYSTEM_CATALOG_SCHEMA, PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_TABLE, PTableType.SYSTEM);
             assertTrue(rs.next());
             assertTableMetaData(rs, SYSTEM_CATALOG_SCHEMA, SYSTEM_FUNCTION_TABLE, SYSTEM);
             assertTrue(rs.next());
@@ -529,7 +530,7 @@ public class TenantSpecificTablesDDLIT extends BaseTenantSpecificTablesIT {
             assertTrue(rs.next());
             // (tenant_id column is not visible in tenant-specific connection)
             assertColumnMetaData(rs, null, TENANT_TABLE_NAME, "tenant_type_id", 2);
-            assertEquals(1, rs.getInt(KEY_SEQ));
+            assertEquals(1, rs.getShort(KEY_SEQ));
             assertTrue(rs.next());
             assertColumnMetaData(rs, null, TENANT_TABLE_NAME, "id", 3);
             assertTrue(rs.next());

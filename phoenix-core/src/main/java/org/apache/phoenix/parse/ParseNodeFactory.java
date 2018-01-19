@@ -25,7 +25,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Collection;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.collect.ArrayListMultimap;
@@ -374,10 +373,10 @@ public class ParseNodeFactory {
         return new DropIndexStatement(indexName, tableName, ifExists);
     }
 
-    public AlterIndexStatement alterIndex(NamedTableNode indexTableNode, String dataTableName, boolean ifExists, PIndexState state, boolean async) {
-        return new AlterIndexStatement(indexTableNode, dataTableName, ifExists, state, async);
+    public AlterIndexStatement alterIndex(NamedTableNode indexTableNode, String dataTableName, boolean ifExists, PIndexState state, boolean async, ListMultimap<String,Pair<String,Object>> props) {
+        return new AlterIndexStatement(indexTableNode, dataTableName, ifExists, state, async, props);
     }
-    
+
     public AlterIndexStatement alterIndex(NamedTableNode indexTableNode, String dataTableName, boolean ifExists, PIndexState state) {
         return new AlterIndexStatement(indexTableNode, dataTableName, ifExists, state, false);
     }
@@ -398,12 +397,34 @@ public class ParseNodeFactory {
         return new NamedNode(name);
     }
 
+    @Deprecated
     public NamedTableNode namedTable(String alias, TableName name) {
         return new NamedTableNode(alias, name);
     }
-
-    public NamedTableNode namedTable(String alias, TableName name ,List<ColumnDef> dyn_columns) {
+    
+    @Deprecated
+    public NamedTableNode namedTable(String alias, TableName name, List<ColumnDef> dyn_columns) {
         return new NamedTableNode(alias, name,dyn_columns);
+    }
+    
+    public NamedTableNode namedTable(String alias, TableName name, Double tableSamplingRate) {
+        return new NamedTableNode(alias, name, tableSamplingRate);
+    }
+    
+    public NamedTableNode namedTable(String alias, TableName name, List<ColumnDef> dyn_columns, Double tableSamplingRate) {
+    	return new NamedTableNode(alias, name,dyn_columns, tableSamplingRate);
+    }
+    
+    public NamedTableNode namedTable(String alias, TableName name, List<ColumnDef> dyn_columns, LiteralParseNode tableSampleNode) {
+    	Double tableSamplingRate;
+    	if(tableSampleNode==null||tableSampleNode.getValue()==null){
+    		tableSamplingRate=ConcreteTableNode.DEFAULT_TABLE_SAMPLING_RATE;
+    	}else if(tableSampleNode.getValue() instanceof Integer){
+    		tableSamplingRate=(double)((int)tableSampleNode.getValue());
+    	}else{
+    		tableSamplingRate=((BigDecimal) tableSampleNode.getValue()).doubleValue();
+    	}
+    	return new NamedTableNode(alias, name, dyn_columns, tableSamplingRate);
     }
 
     public BindTableNode bindTable(String alias, TableName name) {
@@ -731,6 +752,26 @@ public class ParseNodeFactory {
         return new UpsertStatement(table, hint, columns, values, select, bindCount, udfParseNodes, onDupKeyPairs);
     }
 
+    public CursorName cursorName(String name){
+        return new CursorName(name);
+    }
+
+    public DeclareCursorStatement declareCursor(CursorName cursor, SelectStatement select){
+        return new DeclareCursorStatement(cursor, select);
+    }
+
+    public FetchStatement fetch(CursorName cursor, boolean isNext, int fetchLimit){
+        return new FetchStatement(cursor, isNext, fetchLimit);
+    }
+
+    public OpenStatement open(CursorName cursor){
+        return new OpenStatement(cursor);
+    }
+
+    public CloseStatement close(CursorName cursor){
+        return new CloseStatement(cursor);
+    }
+
     public DeleteStatement delete(NamedTableNode table, HintNode hint, ParseNode node, List<OrderByNode> orderBy, LimitNode limit, int bindCount, Map<String, UDFParseNode> udfParseNodes) {
         return new DeleteStatement(table, hint, node, orderBy, limit, bindCount, udfParseNodes);
     }
@@ -883,4 +924,10 @@ public class ParseNodeFactory {
     public UseSchemaStatement useSchema(String schemaName) {
         return new UseSchemaStatement(schemaName);
     }
+
+    public ChangePermsStatement changePermsStatement(String permsString, boolean isSchemaName, TableName tableName
+            , String schemaName, boolean isGroupName, LiteralParseNode userOrGroup, boolean isGrantStatement) {
+        return new ChangePermsStatement(permsString, isSchemaName, tableName, schemaName, isGroupName, userOrGroup, isGrantStatement);
+    }
+
 }

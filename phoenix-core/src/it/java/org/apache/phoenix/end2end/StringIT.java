@@ -16,21 +16,25 @@
  */
 package org.apache.phoenix.end2end;
 
+import static org.apache.phoenix.util.TestUtil.TEST_PROPERTIES;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.sql.Connection;
+import java.sql.Date;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.util.ByteUtil;
+import org.apache.phoenix.util.PropertiesUtil;
 import org.apache.phoenix.util.TestUtil;
 import org.junit.Test;
 
@@ -255,4 +259,60 @@ public class StringIT extends ParallelStatsDisabledIT {
         assertEquals(0, rs.getInt(1));
         assertFalse(rs.next());
     }
+    
+    @Test
+    public void testLpadWithNullArgs() throws Exception {
+        ResultSet rs;
+        Connection conn = DriverManager.getConnection(getUrl());
+        String tableName = generateUniqueName();
+        conn.createStatement().execute("CREATE TABLE " + tableName + " (k CHAR(3) PRIMARY KEY, v1 VARCHAR, v2 INTEGER)");
+        conn.createStatement().execute("UPSERT INTO " + tableName + "(k) VALUES('a')");
+        conn.commit();
+        
+        rs = conn.createStatement().executeQuery("SELECT LPAD(v1, 5, 'ab') FROM " + tableName );
+        assertTrue(rs.next());
+        assertEquals("ababa", rs.getString(1));
+        assertFalse(rs.next());
+        
+        rs = conn.createStatement().executeQuery("SELECT LPAD('abc', v2, 'a') FROM " + tableName );
+        assertTrue(rs.next());
+        rs.getString(1);
+        assertTrue(rs.wasNull());
+        assertFalse(rs.next());
+        
+        rs = conn.createStatement().executeQuery("SELECT LPAD('abc', 5, v1) FROM " + tableName );
+        assertTrue(rs.next());
+        rs.getString(1);
+        assertTrue(rs.wasNull());
+        assertFalse(rs.next());
+    }
+    
+    @Test
+    public void testValidStringConcatExpression() throws Exception {//test fails with stack overflow wee
+        Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
+        Date date = new Date(System.currentTimeMillis());
+        Connection conn = DriverManager.getConnection(getUrl(), props);
+        String tableName =
+                initATableValues(generateUniqueName(), getOrganizationId(), getDefaultSplits(getOrganizationId()),
+                    date, null, getUrl(), "COLUMN_ENCODED_BYTES=0");
+        int counter=0;
+        String[] answers = new String[]{"00D300000000XHP5bar","a5bar","15bar","5bar","5bar"};
+        String[] queries = new String[] { 
+                "SELECT  organization_id || 5 || 'bar' FROM " + tableName + " limit 1",
+                "SELECT a_string || 5 || 'bar' FROM " + tableName + "  order by a_string  limit 1",
+                "SELECT a_integer||5||'bar' FROM " + tableName + " order by a_integer  limit 1",
+                "SELECT x_decimal||5||'bar' FROM " + tableName + " limit 1",
+                "SELECT x_long||5||'bar' FROM " + tableName + " limit 1"
+        };
+
+        for (String query : queries) {
+                PreparedStatement statement = conn.prepareStatement(query);
+                ResultSet rs=statement.executeQuery();
+                assertTrue(rs.next());
+                assertEquals(answers[counter++],rs.getString(1));
+                assertFalse(rs.next());
+        }
+        conn.close();
+    }
+    
 }

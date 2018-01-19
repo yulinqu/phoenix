@@ -51,17 +51,20 @@ import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.phoenix.compile.OrderByCompiler.OrderBy;
 import org.apache.phoenix.coprocessor.BaseScannerRegionObserver;
 import org.apache.phoenix.exception.SQLExceptionCode;
+import org.apache.phoenix.execute.AggregatePlan;
+import org.apache.phoenix.execute.ClientScanPlan;
 import org.apache.phoenix.execute.HashJoinPlan;
+import org.apache.phoenix.execute.ScanPlan;
+import org.apache.phoenix.execute.SortMergeJoinPlan;
+import org.apache.phoenix.execute.TupleProjectionPlan;
 import org.apache.phoenix.expression.Expression;
 import org.apache.phoenix.expression.LiteralExpression;
 import org.apache.phoenix.expression.aggregator.Aggregator;
 import org.apache.phoenix.expression.aggregator.CountAggregator;
 import org.apache.phoenix.expression.aggregator.ServerAggregators;
 import org.apache.phoenix.expression.function.TimeUnit;
-import org.apache.phoenix.filter.ColumnProjectionFilter;
 import org.apache.phoenix.filter.EncodedQualifiersColumnProjectionFilter;
 import org.apache.phoenix.jdbc.PhoenixConnection;
-import org.apache.phoenix.jdbc.PhoenixDatabaseMetaData;
 import org.apache.phoenix.jdbc.PhoenixPreparedStatement;
 import org.apache.phoenix.jdbc.PhoenixStatement;
 import org.apache.phoenix.query.BaseConnectionlessQueryTest;
@@ -79,11 +82,13 @@ import org.apache.phoenix.schema.types.PDecimal;
 import org.apache.phoenix.schema.types.PInteger;
 import org.apache.phoenix.schema.types.PVarchar;
 import org.apache.phoenix.util.ByteUtil;
+import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.apache.phoenix.util.PhoenixRuntime;
 import org.apache.phoenix.util.PropertiesUtil;
 import org.apache.phoenix.util.QueryUtil;
 import org.apache.phoenix.util.ScanUtil;
 import org.apache.phoenix.util.SchemaUtil;
+import org.junit.Ignore;
 import org.junit.Test;
 
 
@@ -777,11 +782,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     
     @Test
     public void testAmbiguousColumn() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT * from multi_cf G where RESPONSE_TIME = 2222";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -794,11 +797,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testTableAliasMatchesCFName() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT F.RESPONSE_TIME,G.RESPONSE_TIME from multi_cf G where G.RESPONSE_TIME-1 = F.RESPONSE_TIME";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -811,11 +812,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testCoelesceFunctionTypeMismatch() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT coalesce(x_integer,'foo') from atable";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -829,11 +828,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testOrderByNotInSelectDistinct() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT distinct a_string,b_string from atable order by x_integer";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -847,11 +844,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testSelectDistinctAndAll() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT all distinct a_string,b_string from atable order by x_integer";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -865,12 +860,10 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testSelectDistinctAndOrderBy() throws Exception {
-        long ts = nextTimestamp();
         String query = "select /*+ RANGE_SCAN */ count(distinct organization_id) from atable order by organization_id";
         String query1 = "select count(distinct organization_id) from atable order by organization_id";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -890,11 +883,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testOrderByNotInSelectDistinctAgg() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT distinct count(1) from atable order by x_integer";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -908,11 +899,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testSelectDistinctWithAggregation() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT distinct a_string,count(*) from atable";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -971,11 +960,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     
     @Test
     public void testStringConcatExpression() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT entity_id,a_string FROM atable where 2 || a_integer || ? like '2%'";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        Connection conn = DriverManager.getConnection(url, props);
+        Connection conn = DriverManager.getConnection(getUrl(), props);
         byte []x=new byte[]{127,127,0,0};//Binary data
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -991,10 +978,8 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     
     @Test
     public void testDivideByBigDecimalZero() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT a_integer/x_integer/0.0 FROM atable";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
-        Connection conn = DriverManager.getConnection(url);
+        Connection conn = DriverManager.getConnection(getUrl());
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -1008,10 +993,8 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testDivideByIntegerZero() throws Exception {
-        long ts = nextTimestamp();
         String query = "SELECT a_integer/0 FROM atable";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
-        Connection conn = DriverManager.getConnection(url);
+        Connection conn = DriverManager.getConnection(getUrl());
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.executeQuery();
@@ -1025,10 +1008,8 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testCreateNullableInPKMiddle() throws Exception {
-        long ts = nextTimestamp();
         String query = "CREATE TABLE foo(i integer not null, j integer null, k integer not null CONSTRAINT pk PRIMARY KEY(i,j,k))";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
-        Connection conn = DriverManager.getConnection(url);
+        Connection conn = DriverManager.getConnection(getUrl());
         try {
             PreparedStatement statement = conn.prepareStatement(query);
             statement.execute();
@@ -1040,9 +1021,7 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
     @Test
     public void testSetSaltBucketOnAlterTable() throws Exception {
-        long ts = nextTimestamp();
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
-        Connection conn = DriverManager.getConnection(url);
+        Connection conn = DriverManager.getConnection(getUrl());
         try {
             conn.createStatement().execute("ALTER TABLE atable ADD xyz INTEGER SALT_BUCKETS=4");
             fail();
@@ -1225,7 +1204,9 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
         }
     }
     
-    
+
+    // see PHOENIX-3534, now tables can have duplicate columns and they are removed implicitly
+    @Ignore
     @Test
     public void testDuplicatePKColumn() throws Exception {
         String ddl = "CREATE TABLE t (k1 VARCHAR, k1 VARCHAR CONSTRAINT pk PRIMARY KEY(k1))";
@@ -1254,33 +1235,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     private void assertImmutableRows(Connection conn, String fullTableName, boolean expectedValue) throws SQLException {
         PhoenixConnection pconn = conn.unwrap(PhoenixConnection.class);
         assertEquals(expectedValue, pconn.getTable(new PTableKey(pconn.getTenantId(), fullTableName)).isImmutableRows());
-    }
-    
-    @Test
-    public void testDeleteFromImmutableWithKV() throws Exception {
-        String ddl = "CREATE TABLE t (k1 VARCHAR, v1 VARCHAR, v2 VARCHAR CONSTRAINT pk PRIMARY KEY(k1)) immutable_rows=true";
-        String indexDDL = "CREATE INDEX i ON t (v1)";
-        Connection conn = DriverManager.getConnection(getUrl());
-        try {
-            conn.createStatement().execute(ddl);
-            assertImmutableRows(conn, "T", true);
-            conn.createStatement().execute(indexDDL);
-            assertImmutableRows(conn, "I", true);
-            conn.createStatement().execute("DELETE FROM t WHERE v2 = 'foo'");
-            fail();
-        } catch (SQLException e) {
-            assertEquals(SQLExceptionCode.INVALID_FILTER_ON_IMMUTABLE_ROWS.getErrorCode(), e.getErrorCode());
-        }
-        // Test with one index having the referenced key value column, but one not having it.
-        // Still should fail
-        try {
-            indexDDL = "CREATE INDEX i2 ON t (v2)";
-            conn.createStatement().execute(indexDDL);
-            conn.createStatement().execute("DELETE FROM t WHERE v2 = 'foo'");
-            fail();
-        } catch (SQLException e) {
-            assertEquals(SQLExceptionCode.INVALID_FILTER_ON_IMMUTABLE_ROWS.getErrorCode(), e.getErrorCode());
-        }
     }
     
     @Test
@@ -1466,7 +1420,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
         } catch (SQLException e) {
             assertEquals(SQLExceptionCode.EXECUTE_UPDATE_WITH_NON_EMPTY_BATCH.getErrorCode(), e.getErrorCode());
         }
-        conn.close();
         try {
             PreparedStatement stmt = conn.prepareStatement("UPSERT INTO atable VALUES('000000000000000','000000000000000')");
             stmt.addBatch();
@@ -2281,18 +2234,20 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
     
     @Test
-    public void testQueryWithSCN() throws Exception {
+    public void testDMLOfNonIndexWithBuildIndexAt() throws Exception {
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.put(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(1000));
-        props.put(QueryServices.TRANSACTIONS_ENABLED, Boolean.TRUE.toString());
+        try (Connection conn = DriverManager.getConnection(getUrl(), props);) {
+            conn.createStatement().execute(
+                    "CREATE TABLE t (k VARCHAR NOT NULL PRIMARY KEY, v1 VARCHAR)");
+        }
+        props.put(PhoenixRuntime.BUILD_INDEX_AT_ATTRIB, Long.toString(EnvironmentEdgeManager.currentTimeMillis()+1));
         try (Connection conn = DriverManager.getConnection(getUrl(), props);) {
             try {
-                conn.createStatement().execute(
-                                "CREATE TABLE t (k VARCHAR NOT NULL PRIMARY KEY, v1 VARCHAR) TRANSACTIONAL=true");
+            	conn.createStatement().execute("UPSERT INTO T (k,v1) SELECT k,v1 FROM T");
                 fail();
             } catch (SQLException e) {
                 assertEquals("Unexpected Exception",
-                        SQLExceptionCode.CANNOT_START_TRANSACTION_WITH_SCN_SET
+                        SQLExceptionCode.ONLY_INDEX_UPDATABLE_AT_SCN
                                 .getErrorCode(), e.getErrorCode());
             }
         }
@@ -2716,6 +2671,21 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
 
     @Test
+    public void testOnDupKeyWithGlobalIndex() throws Exception {
+        Connection conn = DriverManager.getConnection(getUrl());
+        try {
+            conn.createStatement().execute("CREATE TABLE t1 (k integer not null primary key, v bigint)");
+            conn.createStatement().execute("CREATE INDEX idx ON t1 (v)");
+            conn.createStatement().execute("UPSERT INTO t1 VALUES(0,0) ON DUPLICATE KEY UPDATE v = v + 1");
+            fail();
+        } catch (SQLException e) {
+            assertEquals(SQLExceptionCode.CANNOT_USE_ON_DUP_KEY_WITH_GLOBAL_IDX.getErrorCode(), e.getErrorCode());
+        } finally {
+            conn.close();
+        }
+    }
+
+    @Test
     public void testUpdatePKOnDupKey() throws Exception {
         Connection conn = DriverManager.getConnection(getUrl());
         try {
@@ -2786,21 +2756,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
         }
     }
     
-    @Test
-    public void testSCNInOnDupKey() throws Exception {
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=100";
-        Connection conn = DriverManager.getConnection(url);
-        conn.createStatement().execute("CREATE TABLE t1 (k1 integer not null, k2 integer not null, v bigint, constraint pk primary key (k1,k2))");
-        try {
-            conn.createStatement().execute("UPSERT INTO t1 VALUES(0,0) ON DUPLICATE KEY UPDATE v = v + 1");
-            fail();
-        } catch (SQLException e) {
-            assertEquals(SQLExceptionCode.CANNOT_SET_SCN_IN_ON_DUP_KEY.getErrorCode(), e.getErrorCode());
-        } finally {
-            conn.close();
-        }
-    }
-
     @Test
     public void testOrderPreservingGroupBy() throws Exception {
         try (Connection conn= DriverManager.getConnection(getUrl())) {
@@ -3946,5 +3901,252 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
         QueryPlan queryPlan = statement.optimizeQuery(sql);
         queryPlan.iterator();
         return queryPlan;
+    }
+
+    @Test
+    public void testSortMergeJoinSubQueryOrderByOverrideBug3745() throws Exception {
+        Connection conn = null;
+        try {
+            conn= DriverManager.getConnection(getUrl());
+
+            String tableName1="MERGE1";
+            String tableName2="MERGE2";
+
+            conn.createStatement().execute("DROP TABLE if exists "+tableName1);
+
+            String sql="CREATE TABLE IF NOT EXISTS "+tableName1+" ( "+
+                    "AID INTEGER PRIMARY KEY,"+
+                    "AGE INTEGER"+
+                    ")";
+            conn.createStatement().execute(sql);
+
+            conn.createStatement().execute("DROP TABLE if exists "+tableName2);
+            sql="CREATE TABLE IF NOT EXISTS "+tableName2+" ( "+
+                    "BID INTEGER PRIMARY KEY,"+
+                    "CODE INTEGER"+
+                    ")";
+            conn.createStatement().execute(sql);
+
+            //test for simple scan
+            sql="select /*+ USE_SORT_MERGE_JOIN */ a.aid,b.code from (select aid,age from "+tableName1+" where age >=11 and age<=33 order by age limit 3) a inner join "+
+                    "(select bid,code from "+tableName2+" order by code limit 1) b on a.aid=b.bid ";
+
+            QueryPlan queryPlan=getQueryPlan(conn, sql);
+            SortMergeJoinPlan sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            ClientScanPlan lhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getLhsPlan())).getDelegate();
+            OrderBy orderBy=lhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            ScanPlan innerScanPlan=(ScanPlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate();
+            orderBy=innerScanPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AGE"));
+            assertTrue(innerScanPlan.getLimit().intValue() == 3);
+
+            ClientScanPlan rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("BID"));
+            innerScanPlan=(ScanPlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate();
+            orderBy=innerScanPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("CODE"));
+            assertTrue(innerScanPlan.getLimit().intValue() == 1);
+
+            //test for aggregate
+            sql="select /*+ USE_SORT_MERGE_JOIN */ a.aid,b.codesum from (select aid,sum(age) agesum from "+tableName1+" where age >=11 and age<=33 group by aid order by agesum limit 3) a inner join "+
+                    "(select bid,sum(code) codesum from "+tableName2+" group by bid order by codesum limit 1) b on a.aid=b.bid ";
+
+
+            queryPlan=getQueryPlan(conn, sql);
+            sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            lhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getLhsPlan())).getDelegate();
+            orderBy=lhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            AggregatePlan innerAggregatePlan=(AggregatePlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("SUM(AGE)"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 3);
+
+            rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("BID"));
+            innerAggregatePlan=(AggregatePlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("SUM(CODE)"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 1);
+
+            String tableName3="merge3";
+            conn.createStatement().execute("DROP TABLE if exists "+tableName3);
+            sql="CREATE TABLE IF NOT EXISTS "+tableName3+" ( "+
+                    "CID INTEGER PRIMARY KEY,"+
+                    "REGION INTEGER"+
+                    ")";
+            conn.createStatement().execute(sql);
+
+            //test for join
+            sql="select t1.aid,t1.code,t2.region from "+
+                "(select a.aid,b.code from "+tableName1+" a inner join "+tableName2+" b on a.aid=b.bid where b.code >=44 and b.code<=66 order by b.code limit 3) t1 inner join "+
+                "(select a.aid,c.region from "+tableName1+" a inner join "+tableName3+" c on a.aid=c.cid where c.region>=77 and c.region<=99 order by c.region desc limit 1) t2 on t1.aid=t2.aid";
+
+            PhoenixPreparedStatement phoenixPreparedStatement = conn.prepareStatement(sql).unwrap(PhoenixPreparedStatement.class);
+            queryPlan = phoenixPreparedStatement.optimizeQuery(sql);
+            sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            lhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getLhsPlan())).getDelegate();
+            orderBy=lhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerScanPlan=(ScanPlan)((HashJoinPlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerScanPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("B.CODE"));
+            assertTrue(innerScanPlan.getLimit().intValue() == 3);
+
+            rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerScanPlan=(ScanPlan)((HashJoinPlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerScanPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("C.REGION DESC"));
+            assertTrue(innerScanPlan.getLimit().intValue() == 1);
+
+            //test for join and aggregate
+            sql="select t1.aid,t1.codesum,t2.regionsum from "+
+                "(select a.aid,sum(b.code) codesum from "+tableName1+" a inner join "+tableName2+" b on a.aid=b.bid where b.code >=44 and b.code<=66 group by a.aid order by codesum limit 3) t1 inner join "+
+                "(select a.aid,sum(c.region) regionsum from "+tableName1+" a inner join "+tableName3+" c on a.aid=c.cid where c.region>=77 and c.region<=99 group by a.aid order by regionsum desc limit 2) t2 on t1.aid=t2.aid";
+
+            phoenixPreparedStatement = conn.prepareStatement(sql).unwrap(PhoenixPreparedStatement.class);
+            queryPlan = phoenixPreparedStatement.optimizeQuery(sql);
+            sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            lhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getLhsPlan())).getDelegate();
+            orderBy=lhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerAggregatePlan=(AggregatePlan)((HashJoinPlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("SUM(B.CODE)"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 3);
+
+            rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerAggregatePlan=(AggregatePlan)((HashJoinPlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("SUM(C.REGION) DESC"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 2);
+
+            //test for if SubselectRewriter.isOrderByPrefix had take effect
+            sql="select t1.aid,t1.codesum,t2.regionsum from "+
+                "(select a.aid,sum(b.code) codesum from "+tableName1+" a inner join "+tableName2+" b on a.aid=b.bid where b.code >=44 and b.code<=66 group by a.aid order by a.aid,codesum limit 3) t1 inner join "+
+                "(select a.aid,sum(c.region) regionsum from "+tableName1+" a inner join "+tableName3+" c on a.aid=c.cid where c.region>=77 and c.region<=99 group by a.aid order by a.aid desc,regionsum desc limit 2) t2 on t1.aid=t2.aid "+
+                 "order by t1.aid desc";
+
+            phoenixPreparedStatement = conn.prepareStatement(sql).unwrap(PhoenixPreparedStatement.class);
+            queryPlan = phoenixPreparedStatement.optimizeQuery(sql);
+            orderBy=queryPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("T1.AID DESC"));
+            sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            innerAggregatePlan=(AggregatePlan)((HashJoinPlan)(((TupleProjectionPlan)sortMergeJoinPlan.getLhsPlan()).getDelegate())).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 2);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("A.AID"));
+            assertTrue(orderBy.getOrderByExpressions().get(1).toString().equals("SUM(B.CODE)"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 3);
+
+            rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerAggregatePlan=(AggregatePlan)((HashJoinPlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 2);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("A.AID DESC"));
+            assertTrue(orderBy.getOrderByExpressions().get(1).toString().equals("SUM(C.REGION) DESC"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 2);
+        } finally {
+            if(conn!=null) {
+                conn.close();
+            }
+        }
+    }
+
+    @Test
+    public void testUnionDifferentColumnNumber() throws Exception {
+        Connection conn = DriverManager.getConnection(getUrl());
+        Statement statement = conn.createStatement();
+        try {
+            String create = "CREATE TABLE s.t1 (k integer not null primary key, f1.v1 varchar, f1.v2 varchar, " +
+                    "f2.v3 varchar, v4 varchar)";
+            statement.execute(create);
+            create = "CREATE TABLE s.t2 (k integer not null primary key, f1.v1 varchar, f1.v2 varchar, f2.v3 varchar)";
+            statement.execute(create);
+            String query = "SELECT *  FROM s.t1 UNION ALL select * FROM s.t2";
+            statement.executeQuery(query);
+            fail("Should fail with different column numbers ");
+        } catch (SQLException e) {
+            assertEquals(e.getMessage(), "ERROR 525 (42902): SELECT column number differs in a Union All query " +
+                    "is not allowed. 1st query has 5 columns whereas 2nd query has 4");
+        } finally {
+            statement.execute("DROP TABLE IF EXISTS s.t1");
+            statement.execute("DROP TABLE IF EXISTS s.t2");
+            conn.close();
+        }
+    }
+
+    @Test
+    public void testUnionDifferentColumnType() throws Exception {
+        Connection conn = DriverManager.getConnection(getUrl());
+        Statement statement = conn.createStatement();
+        try {
+            String create = "CREATE TABLE s.t1 (k integer not null primary key, f1.v1 varchar, f1.v2 varchar, " +
+                    "f2.v3 varchar, v4 varchar)";
+            statement.execute(create);
+            create = "CREATE TABLE s.t2 (k integer not null primary key, f1.v1 varchar, f1.v2 integer, " +
+                    "f2.v3 varchar, f2.v4 varchar)";
+            statement.execute(create);
+            String query = "SELECT *  FROM s.t1 UNION ALL select * FROM s.t2";
+            statement.executeQuery(query);
+            fail("Should fail with different column types ");
+        } catch (SQLException e) {
+            assertEquals(e.getMessage(), "ERROR 526 (42903): SELECT column types differ in a Union All query " +
+                    "is not allowed. Column # 2 is VARCHAR in 1st query where as it is INTEGER in 2nd query");
+        } finally {
+            statement.execute("DROP TABLE IF EXISTS s.t1");
+            statement.execute("DROP TABLE IF EXISTS s.t2");
+            conn.close();
+        }
+    }
+    
+    @Test
+    public void testCannotCreateStatementOnClosedConnection() throws Exception {
+        Connection conn = DriverManager.getConnection(getUrl());
+        conn.close();
+        try {
+            conn.createStatement();
+            fail();
+        } catch (SQLException e) {
+            assertEquals(e.getErrorCode(), SQLExceptionCode.CONNECTION_CLOSED.getErrorCode());
+        }
+        try {
+            conn.prepareStatement("SELECT * FROM SYSTEM.CATALOG");
+            fail();
+        } catch (SQLException e) {
+            assertEquals(e.getErrorCode(), SQLExceptionCode.CONNECTION_CLOSED.getErrorCode());
+        }
     }
 }

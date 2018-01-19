@@ -33,7 +33,6 @@ import java.sql.ResultSet;
 import java.util.Collection;
 import java.util.Properties;
 
-import org.apache.phoenix.util.PhoenixRuntime;
 import org.apache.phoenix.util.PropertiesUtil;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -43,20 +42,19 @@ import org.junit.runners.Parameterized.Parameters;
 @RunWith(Parameterized.class)
 public class CastAndCoerceIT extends BaseQueryIT {
 
-    public CastAndCoerceIT(String indexDDL, boolean mutable, boolean columnEncoded) {
-        super(indexDDL, mutable, columnEncoded);
+    public CastAndCoerceIT(String indexDDL, boolean columnEncoded) throws Exception {
+        super(indexDDL, columnEncoded, false);
     }
     
     @Parameters(name="CastAndCoerceIT_{index}") // name is used by failsafe as file name in reports
     public static Collection<Object> data() {
-        return QueryIT.data();
+        return BaseQueryIT.allIndexes();
     }
     
     @Test
     public void testCastOperatorInSelect() throws Exception {
         String query = "SELECT CAST(a_integer AS decimal)/2 FROM " + tableName + " WHERE ?=organization_id and 5=a_integer";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -74,7 +72,6 @@ public class CastAndCoerceIT extends BaseQueryIT {
     public void testCastOperatorInWhere() throws Exception {
         String query = "SELECT a_integer FROM " + tableName + " WHERE ?=organization_id and 2.5 = CAST(a_integer AS DECIMAL)/2 ";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -91,7 +88,7 @@ public class CastAndCoerceIT extends BaseQueryIT {
     @Test
     public void testCoerceIntegerToLong() throws Exception {
         String query = "SELECT entity_id FROM " + tableName + " WHERE organization_id=? AND x_long >= x_integer";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
+        String url = getUrl();
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
         Connection conn = DriverManager.getConnection(url, props);
         try {
@@ -111,7 +108,7 @@ public class CastAndCoerceIT extends BaseQueryIT {
     @Test
     public void testCoerceLongToDecimal1() throws Exception {
         String query = "SELECT entity_id FROM " + tableName + " WHERE organization_id=? AND x_decimal > x_integer";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
+        String url = getUrl();
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
         Connection conn = DriverManager.getConnection(url, props);
         try {
@@ -129,7 +126,7 @@ public class CastAndCoerceIT extends BaseQueryIT {
     @Test
     public void testCoerceLongToDecimal2() throws Exception {
         String query = "SELECT entity_id FROM " + tableName + " WHERE organization_id=? AND x_integer <= x_decimal";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
+        String url = getUrl();
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
         Connection conn = DriverManager.getConnection(url, props);
         try {
@@ -147,7 +144,7 @@ public class CastAndCoerceIT extends BaseQueryIT {
     @Test
     public void testCoerceTinyIntToSmallInt() throws Exception {
         String query = "SELECT entity_id FROM " + tableName + " WHERE organization_id=? AND a_byte >= a_short";
-        String url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5); // Run query at timestamp 5
+        String url = getUrl();
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
         Connection conn = DriverManager.getConnection(url, props);
         try {
@@ -173,12 +170,11 @@ public class CastAndCoerceIT extends BaseQueryIT {
         BigDecimal dateAsDecimal;
         String url;
         Connection conn;
-        url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 3);
+        url = getUrl();
         conn = DriverManager.getConnection(url, props);
         conn.setAutoCommit(true);
         conn.createStatement().execute("UPSERT INTO " + tableName + " (organization_id,entity_id,a_time,a_timestamp) SELECT organization_id,entity_id,a_date,a_date FROM " + tableName);
 
-        url = getUrl() + ";" + PhoenixRuntime.CURRENT_SCN_ATTRIB + "=" + (ts + 5);
         conn = DriverManager.getConnection(url, props);
         try {
             query = "SELECT entity_id, CAST(a_date AS BIGINT) FROM " + tableName + " WHERE organization_id=? AND a_date IS NOT NULL LIMIT 1";

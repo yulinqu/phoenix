@@ -44,7 +44,6 @@ import org.apache.phoenix.jdbc.PhoenixStatement;
 import org.apache.phoenix.query.KeyRange;
 import org.apache.phoenix.query.QueryServices;
 import org.apache.phoenix.schema.PNameFactory;
-import org.apache.phoenix.schema.PTableType;
 import org.apache.phoenix.schema.TableNotFoundException;
 import org.apache.phoenix.util.MetaDataUtil;
 import org.apache.phoenix.util.PhoenixRuntime;
@@ -52,6 +51,7 @@ import org.apache.phoenix.util.PropertiesUtil;
 import org.apache.phoenix.util.QueryUtil;
 import org.apache.phoenix.util.SchemaUtil;
 import org.apache.phoenix.util.TestUtil;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -187,7 +187,7 @@ public class ViewIndexIT extends ParallelStatsDisabledIT {
         String sql = "SELECT * FROM " + viewName + " WHERE v2 = 100";
         ResultSet rs = conn1.prepareStatement("EXPLAIN " + sql).executeQuery();
         assertEquals(
-                "CLIENT PARALLEL 1-WAY RANGE SCAN OVER " + SchemaUtil.getPhysicalHBaseTableName(fullTableName, isNamespaceMapped, PTableType.TABLE) + " [1,'10',100]\n" +
+                "CLIENT PARALLEL 1-WAY RANGE SCAN OVER " + SchemaUtil.getPhysicalTableName(Bytes.toBytes(fullTableName), isNamespaceMapped) + " [1,'10',100]\n" +
                 "    SERVER FILTER BY FIRST KEY ONLY\n" +
                 "CLIENT MERGE SORT", QueryUtil.getExplainPlan(rs));
         rs = conn1.prepareStatement(sql).executeQuery();
@@ -221,7 +221,7 @@ public class ViewIndexIT extends ParallelStatsDisabledIT {
         String globalView = generateUniqueName();
         String globalViewIdx =  generateUniqueName();
         try (Connection conn = DriverManager.getConnection(getUrl())) {
-            conn.createStatement().execute("CREATE TABLE " + baseTable + " (TENANT_ID CHAR(15) NOT NULL, PK2 DATE NOT NULL, PK3 INTEGER NOT NULL, KV1 VARCHAR, KV2 VARCHAR, KV3 CHAR(15) CONSTRAINT PK PRIMARY KEY(TENANT_ID, PK2 ROW_TIMESTAMP, PK3)) MULTI_TENANT=true");
+            conn.createStatement().execute("CREATE IMMUTABLE TABLE " + baseTable + " (TENANT_ID CHAR(15) NOT NULL, PK2 DATE NOT NULL, PK3 INTEGER NOT NULL, KV1 VARCHAR, KV2 VARCHAR, KV3 CHAR(15) CONSTRAINT PK PRIMARY KEY(TENANT_ID, PK2 ROW_TIMESTAMP, PK3)) MULTI_TENANT=true");
             conn.createStatement().execute("CREATE VIEW " + globalView + " AS SELECT * FROM " + baseTable);
             conn.createStatement().execute("CREATE INDEX " + globalViewIdx + " ON " + globalView + " (PK3 DESC, KV3) INCLUDE (KV1)");
             PreparedStatement stmt = conn.prepareStatement("UPSERT INTO  " + globalView + " (TENANT_ID, PK2, PK3, KV1, KV3) VALUES (?, ?, ?, ?, ?)");
@@ -362,7 +362,7 @@ public class ViewIndexIT extends ParallelStatsDisabledIT {
             tsConn.createStatement().execute("UPSERT INTO " + tsViewFullName + "(INT1,DOUBLE1,IS_BOOLEAN,TEXT1) VALUES (10,10.0, true, 'j')");
             tsConn.commit();
             
-            String basePhysicalName = SchemaUtil.getPhysicalHBaseTableName(baseFullName, isNamespaceMapped, PTableType.TABLE).getString();
+            String basePhysicalName = SchemaUtil.getPhysicalTableName(Bytes.toBytes(baseFullName), isNamespaceMapped).toString();
             assertRowCount(tsConn, tsViewFullName, basePhysicalName, 10);
             
             tsConn.createStatement().execute("DELETE FROM " + tsViewFullName + " WHERE TEXT1='d'");
@@ -413,4 +413,35 @@ public class ViewIndexIT extends ParallelStatsDisabledIT {
             conn.close();
         }
     }
+    
+    @Test
+    public void testHintForIndexOnViewWithInclude() throws Exception {
+        testHintForIndexOnView(true);
+    }
+    
+    @Ignore("PHOENIX-4274 Hint query for index on view does not use include")
+    @Test
+    public void testHintForIndexOnViewWithoutInclude() throws Exception {
+        testHintForIndexOnView(false);        
+    }
+    
+    private void testHintForIndexOnView(boolean includeColumns) throws Exception {
+        Properties props = new Properties();
+        Connection conn1 = DriverManager.getConnection(getUrl(), props);
+        conn1.setAutoCommit(true);
+        String tableName=generateUniqueName();
+        String viewName=generateUniqueName();
+        String indexName=generateUniqueName();
+        conn1.createStatement().execute(
+          "CREATE TABLE "+tableName+" (k VARCHAR PRIMARY KEY, v1 VARCHAR, v2 VARCHAR) UPDATE_CACHE_FREQUENCY=1000000");
+        conn1.createStatement().execute("upsert into "+tableName+" values ('row1', 'value1', 'key1')");
+        conn1.createStatement().execute(
+          "CREATE VIEW "+viewName+" (v3 VARCHAR, v4 VARCHAR) AS SELECT * FROM "+tableName+" WHERE v1 = 'value1'");
+        conn1.createStatement().execute("CREATE INDEX " + indexName + " ON " + viewName + "(v3)" + (includeColumns ? " INCLUDE(v4)" : ""));
+        PhoenixStatement stmt = conn1.createStatement().unwrap(PhoenixStatement.class);
+        ResultSet rs = stmt.executeQuery("SELECT /*+ INDEX(" + viewName + " " + indexName + ") */ v1 FROM " + viewName + " WHERE v3 = 'foo' ORDER BY v4");
+        assertFalse(rs.next());
+        assertEquals(indexName, stmt.getQueryPlan().getContext().getCurrentTable().getTable().getName().getString());
+    }
+    
 }

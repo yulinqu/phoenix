@@ -71,18 +71,19 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TENANT_ID_INDEX;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TRANSACTIONAL_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TYPE_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.UPDATE_CACHE_FREQUENCY_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.USE_STATS_FOR_PARALLELIZATION_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_CONSTANT_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_INDEX_ID_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_STATEMENT_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_TYPE_BYTES;
 import static org.apache.phoenix.query.QueryConstants.DIVERGED_VIEW_BASE_COLUMN_COUNT;
-import static org.apache.phoenix.query.QueryConstants.SEPARATOR_BYTE_ARRAY;
 import static org.apache.phoenix.schema.PTableType.INDEX;
-import static org.apache.phoenix.util.ByteUtil.EMPTY_BYTE_ARRAY;
+import static org.apache.phoenix.schema.PTableType.TABLE;
 import static org.apache.phoenix.util.SchemaUtil.getVarCharLength;
 import static org.apache.phoenix.util.SchemaUtil.getVarChars;
 
 import java.io.IOException;
+import java.security.PrivilegedExceptionAction;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -90,10 +91,15 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.NavigableMap;
+import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
@@ -102,10 +108,13 @@ import org.apache.hadoop.hbase.Coprocessor;
 import org.apache.hadoop.hbase.CoprocessorEnvironment;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.Type;
+import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Get;
+import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.HTableInterface;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
@@ -115,24 +124,22 @@ import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorException;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorService;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
-import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter;
-import org.apache.hadoop.hbase.filter.SingleColumnValueFilter;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
+import org.apache.hadoop.hbase.ipc.RpcServer.Call;
+import org.apache.hadoop.hbase.ipc.RpcUtil;
 import org.apache.hadoop.hbase.regionserver.Region;
 import org.apache.hadoop.hbase.regionserver.Region.RowLock;
 import org.apache.hadoop.hbase.regionserver.RegionScanner;
+import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.VersionInfo;
 import org.apache.phoenix.cache.GlobalCache;
 import org.apache.phoenix.cache.GlobalCache.FunctionBytesPtr;
-import org.apache.phoenix.compile.ColumnResolver;
-import org.apache.phoenix.compile.FromCompiler;
+import org.apache.phoenix.compile.ColumnNameTrackingExpressionCompiler;
 import org.apache.phoenix.compile.QueryPlan;
 import org.apache.phoenix.compile.ScanRanges;
-import org.apache.phoenix.compile.StatementContext;
-import org.apache.phoenix.compile.WhereCompiler;
 import org.apache.phoenix.coprocessor.generated.MetaDataProtos;
 import org.apache.phoenix.coprocessor.generated.MetaDataProtos.AddColumnRequest;
 import org.apache.phoenix.coprocessor.generated.MetaDataProtos.ClearCacheRequest;
@@ -183,7 +190,6 @@ import org.apache.phoenix.query.QueryServices;
 import org.apache.phoenix.query.QueryServicesOptions;
 import org.apache.phoenix.schema.ColumnFamilyNotFoundException;
 import org.apache.phoenix.schema.ColumnNotFoundException;
-import org.apache.phoenix.schema.ColumnRef;
 import org.apache.phoenix.schema.PColumn;
 import org.apache.phoenix.schema.PColumnFamily;
 import org.apache.phoenix.schema.PColumnImpl;
@@ -200,6 +206,7 @@ import org.apache.phoenix.schema.PTable.QualifierEncodingScheme;
 import org.apache.phoenix.schema.PTable.ViewType;
 import org.apache.phoenix.schema.PTableImpl;
 import org.apache.phoenix.schema.PTableType;
+import org.apache.phoenix.schema.SaltingUtil;
 import org.apache.phoenix.schema.SequenceAllocation;
 import org.apache.phoenix.schema.SequenceAlreadyExistsException;
 import org.apache.phoenix.schema.SequenceKey;
@@ -207,8 +214,6 @@ import org.apache.phoenix.schema.SequenceNotFoundException;
 import org.apache.phoenix.schema.SortOrder;
 import org.apache.phoenix.schema.TableNotFoundException;
 import org.apache.phoenix.schema.TableProperty;
-import org.apache.phoenix.schema.TableRef;
-import org.apache.phoenix.schema.tuple.ResultTuple;
 import org.apache.phoenix.schema.types.PBinary;
 import org.apache.phoenix.schema.types.PBoolean;
 import org.apache.phoenix.schema.types.PDataType;
@@ -234,6 +239,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.cache.Cache;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.protobuf.ByteString;
@@ -293,6 +299,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     private static final KeyValue APPEND_ONLY_SCHEMA_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, APPEND_ONLY_SCHEMA_BYTES);
     private static final KeyValue STORAGE_SCHEME_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, STORAGE_SCHEME_BYTES);
     private static final KeyValue ENCODING_SCHEME_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, ENCODING_SCHEME_BYTES);
+    private static final KeyValue USE_STATS_FOR_PARALLELIZATION_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, USE_STATS_FOR_PARALLELIZATION_BYTES);
     
     private static final List<KeyValue> TABLE_KV_COLUMNS = Arrays.<KeyValue>asList(
             EMPTY_KEYVALUE_KV,
@@ -321,7 +328,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             AUTO_PARTITION_SEQ_KV,
             APPEND_ONLY_SCHEMA_KV,
             STORAGE_SCHEME_KV,
-            ENCODING_SCHEME_KV
+            ENCODING_SCHEME_KV,
+            USE_STATS_FOR_PARALLELIZATION_KV
             );
     static {
         Collections.sort(TABLE_KV_COLUMNS, KeyValue.COMPARATOR);
@@ -353,6 +361,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     private static final int APPEND_ONLY_SCHEMA_INDEX = TABLE_KV_COLUMNS.indexOf(APPEND_ONLY_SCHEMA_KV);
     private static final int STORAGE_SCHEME_INDEX = TABLE_KV_COLUMNS.indexOf(STORAGE_SCHEME_KV);
     private static final int QUALIFIER_ENCODING_SCHEME_INDEX = TABLE_KV_COLUMNS.indexOf(ENCODING_SCHEME_KV);
+    private static final int USE_STATS_FOR_PARALLELIZATION_INDEX = TABLE_KV_COLUMNS.indexOf(USE_STATS_FOR_PARALLELIZATION_KV);
 
     // KeyValues for Column
     private static final KeyValue DECIMAL_DIGITS_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, DECIMAL_DIGITS_BYTES);
@@ -383,6 +392,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             IS_ROW_TIMESTAMP_KV,
             COLUMN_QUALIFIER_KV
             );
+
     static {
         Collections.sort(COLUMN_KV_COLUMNS, KeyValue.COMPARATOR);
     }
@@ -399,7 +409,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     private static final int COLUMN_DEF_INDEX = COLUMN_KV_COLUMNS.indexOf(COLUMN_DEF_KV);
     private static final int IS_ROW_TIMESTAMP_INDEX = COLUMN_KV_COLUMNS.indexOf(IS_ROW_TIMESTAMP_KV);
     private static final int COLUMN_QUALIFIER_INDEX = COLUMN_KV_COLUMNS.indexOf(COLUMN_QUALIFIER_KV);
-    
+
     private static final int LINK_TYPE_INDEX = 0;
 
     private static final KeyValue CLASS_NAME_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, CLASS_NAME_BYTES);
@@ -423,7 +433,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     static {
         Collections.sort(FUNCTION_KV_COLUMNS, KeyValue.COMPARATOR);
     }
-    
+
     private static final int CLASS_NAME_INDEX = FUNCTION_KV_COLUMNS.indexOf(CLASS_NAME_KV);
     private static final int JAR_PATH_INDEX = FUNCTION_KV_COLUMNS.indexOf(JAR_PATH_KV);
     private static final int RETURN_TYPE_INDEX = FUNCTION_KV_COLUMNS.indexOf(RETURN_TYPE_KV);
@@ -440,13 +450,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     static {
         Collections.sort(FUNCTION_ARG_KV_COLUMNS, KeyValue.COMPARATOR);
     }
-    
+
     private static final int IS_ARRAY_INDEX = FUNCTION_ARG_KV_COLUMNS.indexOf(IS_ARRAY_KV);
     private static final int IS_CONSTANT_INDEX = FUNCTION_ARG_KV_COLUMNS.indexOf(IS_CONSTANT_KV);
     private static final int DEFAULT_VALUE_INDEX = FUNCTION_ARG_KV_COLUMNS.indexOf(DEFAULT_VALUE_KV);
     private static final int MIN_VALUE_INDEX = FUNCTION_ARG_KV_COLUMNS.indexOf(MIN_VALUE_KV);
     private static final int MAX_VALUE_INDEX = FUNCTION_ARG_KV_COLUMNS.indexOf(MAX_VALUE_KV);
-    
+
     private static PName newPName(byte[] keyBuffer, int keyOffset, int keyLength) {
         if (keyLength <= 0) {
             return null;
@@ -456,6 +466,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     }
 
     private RegionCoprocessorEnvironment env;
+
+    private PhoenixMetaDataCoprocessorHost phoenixAccessCoprocessorHost;
+    private boolean accessCheckEnabled;
+    private boolean blockWriteRebuildIndex;
+    private int maxIndexesPerTable;
+    private boolean isTablesMappingEnabled;
+
 
     /**
      * Stores a reference to the coprocessor environment provided by the
@@ -474,6 +491,18 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         } else {
             throw new CoprocessorException("Must be loaded on a table region!");
         }
+        
+        phoenixAccessCoprocessorHost = new PhoenixMetaDataCoprocessorHost(this.env);
+        Configuration config = env.getConfiguration();
+        this.accessCheckEnabled = config.getBoolean(QueryServices.PHOENIX_ACLS_ENABLED,
+                QueryServicesOptions.DEFAULT_PHOENIX_ACLS_ENABLED);
+        this.blockWriteRebuildIndex  = config.getBoolean(QueryServices.INDEX_FAILURE_BLOCK_WRITE,
+                QueryServicesOptions.DEFAULT_INDEX_FAILURE_BLOCK_WRITE);
+        this.maxIndexesPerTable = config.getInt(QueryServices.MAX_INDEXES_PER_TABLE,
+                    QueryServicesOptions.DEFAULT_MAX_INDEXES_PER_TABLE);
+        this.isTablesMappingEnabled = SchemaUtil.isNamespaceMappingEnabled(PTableType.TABLE,
+                new ReadOnlyProps(config.iterator()));
+
         logger.info("Starting Tracing-Metrics Systems");
         // Start the phoenix trace collection
         Tracing.addTraceMetricsSource();
@@ -510,19 +539,22 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             }
 
             long currentTime = EnvironmentEdgeManager.currentTimeMillis();
-            PTable table = doGetTable(key, request.getClientTimestamp());
+            PTable table = doGetTable(key, request.getClientTimestamp(), request.getClientVersion());
             if (table == null) {
                 builder.setReturnCode(MetaDataProtos.MutationCode.TABLE_NOT_FOUND);
                 builder.setMutationTime(currentTime);
                 done.run(builder.build());
                 return;
             }
+            getCoprocessorHost().preGetTable(Bytes.toString(tenantId), SchemaUtil.getTableName(schemaName, tableName),
+                    TableName.valueOf(table.getPhysicalName().getBytes()));
+
             builder.setReturnCode(MetaDataProtos.MutationCode.TABLE_ALREADY_EXISTS);
             long disableIndexTimestamp = table.getIndexDisableTimestamp();
             long minNonZerodisableIndexTimestamp = disableIndexTimestamp > 0 ? disableIndexTimestamp : Long.MAX_VALUE;
             for (PTable index : table.getIndexes()) {
                 disableIndexTimestamp = index.getIndexDisableTimestamp();
-                if (disableIndexTimestamp > 0 && index.getIndexState() == PIndexState.ACTIVE && disableIndexTimestamp < minNonZerodisableIndexTimestamp) {
+                if (disableIndexTimestamp > 0 && (index.getIndexState() == PIndexState.ACTIVE || index.getIndexState() == PIndexState.PENDING_ACTIVE) && disableIndexTimestamp < minNonZerodisableIndexTimestamp) {
                     minNonZerodisableIndexTimestamp = disableIndexTimestamp;
                 }
             }
@@ -535,32 +567,238 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 // Subtract one because we add one due to timestamp granularity in Windows
                 builder.setMutationTime(minNonZerodisableIndexTimestamp - 1);
             }
-
-            if (table.getTimeStamp() != tableTimeStamp) {
+            Pair<PTable, MetaDataProtos.MutationCode> pair = combineColumns(table, tenantId, schemaName, tableName, request.getClientTimestamp(), request.getClientVersion());
+            table = pair.getFirst();
+            if (table == null) {
+                builder.setReturnCode(pair.getSecond());
+                builder.setMutationTime(currentTime);
+            }
+            else if (table.getTimeStamp() != tableTimeStamp) {
                 builder.setTable(PTableImpl.toProto(table));
             }
             done.run(builder.build());
-            return;
         } catch (Throwable t) {
         	logger.error("getTable failed", t);
             ProtobufUtil.setControllerException(controller,
                 ServerUtil.createIOException(SchemaUtil.getTableName(schemaName, tableName), t));
         }
     }
+    
+	private Pair<PTable, MetaDataProtos.MutationCode> combineColumns(PTable table, byte[] tenantId, byte[] schemaName,
+			byte[] tableName, long timestamp, int clientVersion) throws SQLException, IOException {
+		// combine columns for view and view indexes
+		boolean hasIndexId = table.getViewIndexId() != null;
+		if (table.getType() != PTableType.VIEW && !hasIndexId) {
+			return new Pair<PTable, MetaDataProtos.MutationCode>(table, MetaDataProtos.MutationCode.TABLE_ALREADY_EXISTS);
+		}
+		boolean isDiverged = isDivergedView(table);
+		// here you combine columns from the parent tables
+		// the logic is as follows, if the PColumn is in the EXCLUDED_COLUMNS
+		// remove it,
+		// otherwise priority of keeping duplicate columns is child -> parent
+		List<byte[]> ancestorList = Lists.newArrayList();
+		TableViewFinderResult viewFinderResult = new TableViewFinderResult();
+		if (PTableType.VIEW == table.getType()) {
+			findAncestorViews(tenantId, schemaName, tableName, viewFinderResult);
+		} else { // is a view index
+			findAncestorViewsOfIndex(tenantId, schemaName, tableName, viewFinderResult);
+		}
+		if (viewFinderResult.getResults().isEmpty()) {
+			// no need to combine columns for local indexes on regular tables
+			return new Pair<PTable, MetaDataProtos.MutationCode>(table, MetaDataProtos.MutationCode.TABLE_ALREADY_EXISTS);
+		}
+		for (TableInfo viewInfo : viewFinderResult.getResults()) {
+			ancestorList.add(viewInfo.getRowKeyPrefix());
+		}
+		List<PColumn> allColumns = Lists.newArrayList();
+		List<PColumn> excludedColumns = Lists.newArrayList();
+		// add my own columns first in reverse order
+		List<PColumn> myColumns = table.getColumns();
+		for (int i = myColumns.size() - 1; i >= 0; i--) {
+			PColumn pColumn = myColumns.get(i);
+			if (pColumn.isExcluded()) {
+				excludedColumns.add(pColumn);
+			} else if (!pColumn.equals(SaltingUtil.SALTING_COLUMN)) { // skip salted column as it will be added from the base table columns
+				allColumns.add(pColumn);
+			}
+		}
+		// index columns that have been dropped in the parent table
+		boolean isSalted = table.getBucketNum() != null;
+		int indexPosOffset = (isSalted ? 1 : 0) + (table.isMultiTenant() ? 1 : 0) + 1;
+		// map from indexed expression to list of data columns that have been dropped
+		Map<PColumn, List<String>> droppedColMap = Maps.newHashMapWithExpectedSize(table.getColumns().size());
+		if (hasIndexId) {
+			ColumnNameTrackingExpressionCompiler expressionCompiler = new ColumnNameTrackingExpressionCompiler();
+	        for (int i = indexPosOffset; i < table.getPKColumns().size(); i++) {
+	            PColumn indexColumn = table.getPKColumns().get(i);
+	            try {
+	                expressionCompiler.reset();
+	                String expressionStr = IndexUtil.getIndexColumnExpressionStr(indexColumn);
+	                ParseNode parseNode  = SQLParser.parseCondition(expressionStr);
+	                parseNode.accept(expressionCompiler);
+	                droppedColMap.put(indexColumn, Lists.newArrayList(expressionCompiler.getDataColumnNames()));
+	            } catch (SQLException e) {
+	                throw new RuntimeException(e); // Impossible
+	            }
+	        }
+		}
+		// now go up from child to parent all the way to the base table:
+		PTable baseTable = null;
+		long maxTableTimestamp = -1;
+		int numPKCols = table.getPKColumns().size();
+		for (int i = 0; i < ancestorList.size(); i++) {
+			byte[] tableInQuestion = ancestorList.get(i);
+			PTable pTable = this.doGetTable(tableInQuestion, timestamp, clientVersion);
+			if (pTable == null) {
+				String tableNameLink = Bytes.toString(tableInQuestion);
+				throw new TableNotFoundException("ERROR COMBINING COLUMNS FOR: " + tableNameLink);
+			} else {
+				// if it has an index id only combine columns for view indexes
+				// (and not local indexes on regular tables)
+				if (i == 0 && hasIndexId && pTable.getType() != PTableType.VIEW) {
+					return new Pair<PTable, MetaDataProtos.MutationCode>(table, MetaDataProtos.MutationCode.TABLE_ALREADY_EXISTS);
+				}
+				if (TABLE.equals(pTable.getType())) {
+					baseTable = pTable;
+				}
+				maxTableTimestamp = Math.max(maxTableTimestamp, pTable.getTimeStamp());
+				if (hasIndexId) {
+					// add all pk columns of parent tables to indexes
+					for (PColumn column : pTable.getPKColumns()) {
+						if (column.isExcluded()) {
+							continue;
+						}
+						column = IndexUtil.getIndexPKColumn(++numPKCols, column);
+						int existingColumnIndex = allColumns.indexOf(column);
+						if (existingColumnIndex == -1) {
+							allColumns.add(0, column);
+						}
+						// TODO should we just generate columnsToAdd here (since
+						// it doesnt need to be reversed)
+					}
+					for (int j = 0; j < pTable.getColumns().size(); j++) {
+						PColumn tableColumn = pTable.getColumns().get(j);
+						if (tableColumn.isExcluded()) {
+							continue;
+						}
+						String dataColumnName = tableColumn.getName().getString();
+						// remove from list of dropped columns since it
+						// still exists
+						for (Entry<PColumn, List<String>> entry : droppedColMap.entrySet()) {
+							entry.getValue().remove(dataColumnName);
+						}
+					}
+				} else {
+					List<PColumn> someTablesColumns = PTableImpl.getColumnsToClone(pTable);
+					if (someTablesColumns != null) {
+						for (int j = someTablesColumns.size() - 1; j >= 0; j--) {
+							PColumn column = someTablesColumns.get(j);
+							// For diverged views we always include pk columns
+							// of the base table. We have to include these pk
+							// columns to be able to support adding pk columns
+							// to the diverged view
+							// We only include regular columns that were created
+							// before the view diverged
+							if (isDiverged && column.getFamilyName()!=null && column.getTimestamp() > table.getTimeStamp()) {
+								continue;
+							}
+							// need to check if this column is in the list of excluded (dropped) columns of the view
+							int existingIndex = excludedColumns.indexOf(column);
+							if (existingIndex != -1) {
+								// if it is, only exclude the column if was
+								// created before the column was dropped in the
+								// view in order to handle the case where a base
+								// table column is dropped in a view, then
+								// dropped in the base table and then added back
+								// to the base table
+								if (column.getTimestamp() <= excludedColumns.get(existingIndex).getTimestamp()) {
+									continue;
+								}
+							}
+							if (column.isExcluded()) {
+								excludedColumns.add(column);
+							} else {
+								int existingColumnIndex = allColumns.indexOf(column);
+								if (existingColumnIndex != -1) {
+									// TODO ask james about this
+									// we always keep the parent table column so
+									// that we can handle
+									// the case when you add a column that
+									// already exists in a view to the base
+									// table
+									PColumn existingColumn = allColumns.get(existingColumnIndex);
+									// if (column.getTimestamp() <
+									// existingColumn.getTimestamp()) {
+									allColumns.remove(existingColumnIndex);
+									allColumns.add(column);
+									// }
+								} else {
+									allColumns.add(column);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		for (Entry<PColumn, List<String>> entry : droppedColMap.entrySet()) {
+			if (!entry.getValue().isEmpty()) {
+				PColumn indexColumnToBeDropped = entry.getKey();
+				if (SchemaUtil.isPKColumn(indexColumnToBeDropped)) {
+					// if an indexed column was dropped in an ancestor then we
+					// cannot use this index an more
+					// TODO figure out a way to actually drop this view index
+					return new Pair<PTable, MetaDataProtos.MutationCode>(null, MetaDataProtos.MutationCode.TABLE_NOT_FOUND);
+				} else {
+					allColumns.remove(indexColumnToBeDropped);
+				}
+			}
+		}
+		// lets remove the excluded columns first if the timestamp is newer than
+		// the added column
+		for (PColumn excludedColumn : excludedColumns) {
+			int index = allColumns.indexOf(excludedColumn);
+			if (index != -1) {
+				if (allColumns.get(index).getTimestamp() <= excludedColumn.getTimestamp()) {
+					allColumns.remove(excludedColumn);
+				}
+			}
+		}
+		List<PColumn> columnsToAdd = Lists.newArrayList();
+		int position = isSalted ? 1 : 0;
+		for (int i = allColumns.size() - 1; i >= 0; i--) {
+			PColumn column = allColumns.get(i);
+			if (table.getColumns().contains(column)) {
+				// for views this column is not derived from an ancestor
+				columnsToAdd.add(new PColumnImpl(column, position));
+			} else {
+				columnsToAdd.add(new PColumnImpl(column, true, position));
+			}
+			position++;
+		}
+		// need to have the columns in the PTable to use the WhereCompiler
+		// unfortunately so this needs to be done
+		// twice....
+		// TODO set the view properties correctly instead of just setting them
+		// same as the base table
+		int baseTableColumnCount = isDiverged ? QueryConstants.DIVERGED_VIEW_BASE_COLUMN_COUNT : columnsToAdd.size() - myColumns.size();
+		PTableImpl pTable = PTableImpl.makePTable(table, baseTable, columnsToAdd, maxTableTimestamp, baseTableColumnCount);
+		return WhereConstantParser.addViewInfoToPColumnsIfNeeded(pTable);
+	}
+
+    private PhoenixMetaDataCoprocessorHost getCoprocessorHost() {
+        return phoenixAccessCoprocessorHost;
+    }
 
     private PTable buildTable(byte[] key, ImmutableBytesPtr cacheKey, Region region,
-            long clientTimeStamp) throws IOException, SQLException {
+            long clientTimeStamp, int clientVersion) throws IOException, SQLException {
         Scan scan = MetaDataUtil.newTableRowsScan(key, MIN_TABLE_TIMESTAMP, clientTimeStamp);
-        RegionScanner scanner = region.getScanner(scan);
-
         Cache<ImmutableBytesPtr,PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
-        try {
+        try (RegionScanner scanner = region.getScanner(scan)) {
             PTable oldTable = (PTable)metaDataCache.getIfPresent(cacheKey);
             long tableTimeStamp = oldTable == null ? MIN_TABLE_TIMESTAMP-1 : oldTable.getTimeStamp();
             PTable newTable;
-            boolean blockWriteRebuildIndex = env.getConfiguration().getBoolean(QueryServices.INDEX_FAILURE_BLOCK_WRITE, 
-                    QueryServicesOptions.DEFAULT_INDEX_FAILURE_BLOCK_WRITE);
-            newTable = getTable(scanner, clientTimeStamp, tableTimeStamp);
+            newTable = getTable(scanner, clientTimeStamp, tableTimeStamp, clientVersion);
             if (newTable == null) {
                 return null;
             }
@@ -576,8 +814,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 metaDataCache.put(cacheKey, newTable);
             }
             return newTable;
-        } finally {
-            scanner.close();
         }
     }
 
@@ -594,13 +830,10 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         ScanRanges scanRanges = ScanRanges.createPointLookup(keyRanges);
         scanRanges.initializeScan(scan);
         scan.setFilter(scanRanges.getSkipScanFilter());
-
-        RegionScanner scanner = region.getScanner(scan);
-
         Cache<ImmutableBytesPtr,PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
         List<PFunction> functions = new ArrayList<PFunction>();
         PFunction function = null;
-        try {
+        try (RegionScanner scanner = region.getScanner(scan)) {
             for(int i = 0; i< keys.size(); i++) {
                 function = null;
                 function =
@@ -617,8 +850,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 functions.add(function);
             }
             return functions;
-        } finally {
-            scanner.close();
         }
     }
 
@@ -635,13 +866,10 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         ScanRanges scanRanges = ScanRanges.createPointLookup(keyRanges);
         scanRanges.initializeScan(scan);
         scan.setFilter(scanRanges.getSkipScanFilter());
-
-        RegionScanner scanner = region.getScanner(scan);
-
         Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
         List<PSchema> schemas = new ArrayList<PSchema>();
         PSchema schema = null;
-        try {
+        try (RegionScanner scanner = region.getScanner(scan)) {
             for (int i = 0; i < keys.size(); i++) {
                 schema = null;
                 schema = getSchema(scanner, clientTimeStamp);
@@ -650,19 +878,22 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 schemas.add(schema);
             }
             return schemas;
-        } finally {
-            scanner.close();
         }
     }
 
-    private void addIndexToTable(PName tenantId, PName schemaName, PName indexName, PName tableName, long clientTimeStamp, List<PTable> indexes) throws IOException, SQLException {
+    private void addIndexToTable(PName tenantId, PName schemaName, PName indexName, PName tableName, long clientTimeStamp, List<PTable> indexes, int clientVersion) throws IOException, SQLException {
         byte[] key = SchemaUtil.getTableKey(tenantId == null ? ByteUtil.EMPTY_BYTE_ARRAY : tenantId.getBytes(), schemaName.getBytes(), indexName.getBytes());
-        PTable indexTable = doGetTable(key, clientTimeStamp);
+        PTable indexTable = doGetTable(key, clientTimeStamp, clientVersion);
         if (indexTable == null) {
             ServerUtil.throwIOException("Index not found", new TableNotFoundException(schemaName.getString(), indexName.getString()));
             return;
         }
         indexes.add(indexTable);
+    }
+
+    private void addExcludedColumnToTable(List<PColumn> pColumns, PName colName, PName famName, long timestamp) {
+        PColumnImpl pColumn = PColumnImpl.createExcludedColumn(famName, colName, timestamp);
+        pColumns.add(pColumn);
     }
 
     private void addColumnToTable(List<Cell> results, PName colName, PName famName,
@@ -736,19 +967,20 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 isRowTimestampKV == null ? false : Boolean.TRUE.equals(PBoolean.INSTANCE.toObject(
                         isRowTimestampKV.getValueArray(), isRowTimestampKV.getValueOffset(),
                         isRowTimestampKV.getValueLength()));
-        
+
         boolean isPkColumn = famName == null || famName.getString() == null;
         Cell columnQualifierKV = colKeyValues[COLUMN_QUALIFIER_INDEX];
         // Older tables won't have column qualifier metadata present. To make things simpler, just set the
         // column qualifier bytes by using the column name.
-        byte[] columnQualifierBytes = columnQualifierKV != null ? 
+        byte[] columnQualifierBytes = columnQualifierKV != null ?
                 Arrays.copyOfRange(columnQualifierKV.getValueArray(),
                     columnQualifierKV.getValueOffset(), columnQualifierKV.getValueOffset()
                             + columnQualifierKV.getValueLength()) : (isPkColumn ? null : colName.getBytes());
-        PColumn column = new PColumnImpl(colName, famName, dataType, maxLength, scale, isNullable, position-1, sortOrder, arraySize, viewConstant, isViewReferenced, expressionStr, isRowTimestamp, false, columnQualifierBytes);
+        PColumn column = new PColumnImpl(colName, famName, dataType, maxLength, scale, isNullable, position-1, sortOrder, arraySize, viewConstant, isViewReferenced, expressionStr, isRowTimestamp, false, columnQualifierBytes,
+            results.get(0).getTimestamp());
         columns.add(column);
     }
-    
+
     private void addArgumentToFunction(List<Cell> results, PName functionName, PName type,
         Cell[] functionKeyValues, List<FunctionArgument> arguments, short argPosition) throws SQLException {
         int i = 0;
@@ -804,7 +1036,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         arguments.add(arg);
     }
 
-    private PTable getTable(RegionScanner scanner, long clientTimeStamp, long tableTimeStamp)
+    private PTable getTable(RegionScanner scanner, long clientTimeStamp, long tableTimeStamp, int clientVersion)
         throws IOException, SQLException {
         List<Cell> results = Lists.newArrayList();
         scanner.next(results);
@@ -905,6 +1137,11 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         PIndexState indexState =
                 indexStateKv == null ? null : PIndexState.fromSerializedValue(indexStateKv
                         .getValueArray()[indexStateKv.getValueOffset()]);
+        // If client is not yet up to 4.12, then translate PENDING_ACTIVE to ACTIVE (as would have been
+        // the value in those versions) since the client won't have this index state in its enum.
+        if (indexState == PIndexState.PENDING_ACTIVE && clientVersion < PhoenixDatabaseMetaData.MIN_PENDING_ACTIVE_INDEX) {
+            indexState = PIndexState.ACTIVE;
+        }
         Cell immutableRowsKv = tableKeyValues[IMMUTABLE_ROWS_INDEX];
         boolean isImmutableRows =
                 immutableRowsKv == null ? false : (Boolean) PBoolean.INSTANCE.toObject(
@@ -962,6 +1199,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         QualifierEncodingScheme encodingScheme = encodingSchemeKv == null ? QualifierEncodingScheme.NON_ENCODED_QUALIFIERS : QualifierEncodingScheme
                 .fromSerializedValue((byte)PTinyint.INSTANCE.toObject(encodingSchemeKv.getValueArray(),
                     encodingSchemeKv.getValueOffset(), encodingSchemeKv.getValueLength()));
+        Cell useStatsForParallelizationKv = tableKeyValues[USE_STATS_FOR_PARALLELIZATION_INDEX];
+        Boolean useStatsForParallelization = useStatsForParallelizationKv == null ? null : Boolean.TRUE.equals(PBoolean.INSTANCE.toObject(useStatsForParallelizationKv.getValueArray(), useStatsForParallelizationKv.getValueOffset(), useStatsForParallelizationKv.getValueLength()));
         
         List<PColumn> columns = Lists.newArrayListWithExpectedSize(columnCount);
         List<PTable> indexes = Lists.newArrayList();
@@ -985,29 +1224,36 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
           if (isQualifierCounterKV(colKv)) {
               Integer value = PInteger.INSTANCE.getCodec().decodeInt(colKv.getValueArray(), colKv.getValueOffset(), SortOrder.ASC);
               cqCounter.setValue(famName.getString(), value);
-          } else if (Bytes.compareTo(LINK_TYPE_BYTES, 0, LINK_TYPE_BYTES.length, colKv.getQualifierArray(), colKv.getQualifierOffset(), colKv.getQualifierLength())==0) {    
+          } else if (Bytes.compareTo(LINK_TYPE_BYTES, 0, LINK_TYPE_BYTES.length, colKv.getQualifierArray(), colKv.getQualifierOffset(), colKv.getQualifierLength())==0) {
               LinkType linkType = LinkType.fromSerializedValue(colKv.getValueArray()[colKv.getValueOffset()]);
               if (linkType == LinkType.INDEX_TABLE) {
-                  addIndexToTable(tenantId, schemaName, famName, tableName, clientTimeStamp, indexes);
+                  addIndexToTable(tenantId, schemaName, famName, tableName, clientTimeStamp, indexes, clientVersion);
               } else if (linkType == LinkType.PHYSICAL_TABLE) {
                   physicalTables.add(famName);
               } else if (linkType == LinkType.PARENT_TABLE) {
                   parentTableName = PNameFactory.newName(SchemaUtil.getTableNameFromFullName(famName.getBytes()));
                   parentSchemaName = PNameFactory.newName(SchemaUtil.getSchemaNameFromFullName(famName.getBytes()));
+              } else if (linkType == LinkType.EXCLUDED_COLUMN) {
+                  // add the excludedColumn
+                  addExcludedColumnToTable(columns, colName, famName, colKv.getTimestamp());
               }
           } else {
+              // CM: should we add the lookup to the parent tables here?
               addColumnToTable(results, colName, famName, colKeyValues, columns, saltBucketNum != null);
           }
         }
+        // TODO: rg should we adjust the ordinal position?
+
+
         // Avoid querying the stats table because we're holding the rowLock here. Issuing an RPC to a remote
         // server while holding this lock is a bad idea and likely to cause contention.
         return PTableImpl.makePTable(tenantId, schemaName, tableName, tableType, indexState, timeStamp, tableSeqNum,
                 pkName, saltBucketNum, columns, parentSchemaName, parentTableName, indexes, isImmutableRows, physicalTables, defaultFamilyName,
                 viewStatement, disableWAL, multiTenant, storeNulls, viewType, viewIndexId, indexType,
                 rowKeyOrderOptimizable, transactional, updateCacheFrequency, baseColumnCount,
-                indexDisableTimestamp, isNamespaceMapped, autoPartitionSeq, isAppendOnlySchema, storageScheme, encodingScheme, cqCounter);
+                indexDisableTimestamp, isNamespaceMapped, autoPartitionSeq, isAppendOnlySchema, storageScheme, encodingScheme, cqCounter, useStatsForParallelization);
     }
-    
+
     private boolean isQualifierCounterKV(Cell kv) {
         int cmp =
                 Bytes.compareTo(kv.getQualifierArray(), kv.getQualifierOffset(),
@@ -1015,7 +1261,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     QUALIFIER_COUNTER_KV.getQualifierOffset(), QUALIFIER_COUNTER_KV.getQualifierLength());
         return cmp == 0;
     }
-    
+
     private PSchema getSchema(RegionScanner scanner, long clientTimeStamp) throws IOException, SQLException {
         List<Cell> results = Lists.newArrayList();
         scanner.next(results);
@@ -1134,7 +1380,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             PName typeName =
                     newPName(typeKv.getRowArray(), typeKv.getRowOffset() + offset, typeKeyLength
                             - offset - 3);
-            
+
             int argPositionOffset =  offset + typeName.getBytes().length + 1;
             short argPosition = Bytes.toShort(typeKv.getRowArray(), typeKv.getRowOffset() + argPositionOffset, typeKeyLength
                 - argPositionOffset);
@@ -1149,7 +1395,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         return new PFunction(tenantId, functionName.getString(), arguments, returnType.getString(),
                 className.getString(), jarPath == null ? null : jarPath.getString(), timeStamp);
     }
-    
+
     private PTable buildDeletedTable(byte[] key, ImmutableBytesPtr cacheKey, Region region,
         long clientTimeStamp) throws IOException {
         if (clientTimeStamp == HConstants.LATEST_TIMESTAMP) {
@@ -1176,7 +1422,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         return null;
     }
 
-    
+
     private PFunction buildDeletedFunction(byte[] key, ImmutableBytesPtr cacheKey, Region region,
         long clientTimeStamp) throws IOException {
         if (clientTimeStamp == HConstants.LATEST_TIMESTAMP) {
@@ -1254,13 +1500,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     }
 
     private PTable loadTable(RegionCoprocessorEnvironment env, byte[] key,
-        ImmutableBytesPtr cacheKey, long clientTimeStamp, long asOfTimeStamp)
+        ImmutableBytesPtr cacheKey, long clientTimeStamp, long asOfTimeStamp, int clientVersion)
         throws IOException, SQLException {
         Region region = env.getRegion();
         Cache<ImmutableBytesPtr,PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
         PTable table = (PTable)metaDataCache.getIfPresent(cacheKey);
         // We always cache the latest version - fault in if not in cache
-        if (table != null || (table = buildTable(key, cacheKey, region, asOfTimeStamp)) != null) {
+        if (table != null || (table = buildTable(key, cacheKey, region, asOfTimeStamp, clientVersion)) != null) {
             return table;
         }
         // if not found then check if newer table already exists and add delete marker for timestamp
@@ -1314,16 +1560,18 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     }
 
     /**
-     * 
+     *
      * @return null if the physical table row information is not present.
-     * 
+     *
      */
-    private static Mutation getPhysicalTableForView(List<Mutation> tableMetadata, byte[][] parentSchemaTableNames) {
+    private static Mutation getPhysicalTableRowForView(List<Mutation> tableMetadata, byte[][] parentTenantSchemaTableNames, byte[][] physicalSchemaTableNames) {
         int size = tableMetadata.size();
         byte[][] rowKeyMetaData = new byte[3][];
         MetaDataUtil.getTenantIdAndSchemaAndTableName(tableMetadata, rowKeyMetaData);
         Mutation physicalTableRow = null;
+        Mutation parentTableRow = null;
         boolean physicalTableLinkFound = false;
+        boolean parentTableLinkFound = false;
         if (size >= 2) {
             int i = size - 1;
             while (i >= 1) {
@@ -1333,30 +1581,53 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     if (linkType == LinkType.PHYSICAL_TABLE) {
                         physicalTableRow = m;
                         physicalTableLinkFound = true;
-                        break;
                     }
+                    if (linkType == LinkType.PARENT_TABLE) {
+                        parentTableRow=m;
+                        parentTableLinkFound = true;
+                    }
+                }
+                if(physicalTableLinkFound && parentTableLinkFound){
+                    break;
                 }
                 i--;
             }
         }
-        if (!physicalTableLinkFound) {
-            parentSchemaTableNames[0] = null;
-            parentSchemaTableNames[1] = null;
-            return null;
+        if (!parentTableLinkFound) {
+            parentTenantSchemaTableNames[0] = null;
+            parentTenantSchemaTableNames[1] = null;
+            parentTenantSchemaTableNames[2] = null;
+            
         }
-        rowKeyMetaData = new byte[5][];
-        getVarChars(physicalTableRow.getRow(), 5, rowKeyMetaData);
+        if (!physicalTableLinkFound) {
+            physicalSchemaTableNames[0] = null;
+            physicalSchemaTableNames[1] = null;
+            physicalSchemaTableNames[2] = null;
+        }
+        if (physicalTableLinkFound) {
+            getSchemaTableNames(physicalTableRow,physicalSchemaTableNames);
+        }
+        if (parentTableLinkFound) {
+            getSchemaTableNames(parentTableRow,parentTenantSchemaTableNames);   
+        }
+        return physicalTableRow;
+    }
+    
+    private static void getSchemaTableNames(Mutation row, byte[][] schemaTableNames) {
+        byte[][] rowKeyMetaData = new byte[5][];
+        getVarChars(row.getRow(), 5, rowKeyMetaData);
+        byte[] tenantId = rowKeyMetaData[PhoenixDatabaseMetaData.TENANT_ID_INDEX];
         byte[] colBytes = rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX];
         byte[] famBytes = rowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX];
         if ((colBytes == null || colBytes.length == 0) && (famBytes != null && famBytes.length > 0)) {
             byte[] sName = SchemaUtil.getSchemaNameFromFullName(famBytes).getBytes();
             byte[] tName = SchemaUtil.getTableNameFromFullName(famBytes).getBytes();
-            parentSchemaTableNames[0] = sName;
-            parentSchemaTableNames[1] = tName;
+            schemaTableNames[0]= tenantId;
+            schemaTableNames[1] = sName;
+            schemaTableNames[2] = tName;
         }
-        return physicalTableRow;
     }
-    
+
     @Override
     public void createTable(RpcController controller, CreateTableRequest request,
             RpcCallback<MetaDataResponse> done) {
@@ -1365,40 +1636,164 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         byte[] schemaName = null;
         byte[] tableName = null;
         try {
+            int clientVersion = request.getClientVersion();
             List<Mutation> tableMetadata = ProtobufUtil.getMutations(request);
             MetaDataUtil.getTenantIdAndSchemaAndTableName(tableMetadata, rowKeyMetaData);
             byte[] tenantIdBytes = rowKeyMetaData[PhoenixDatabaseMetaData.TENANT_ID_INDEX];
             schemaName = rowKeyMetaData[PhoenixDatabaseMetaData.SCHEMA_NAME_INDEX];
             tableName = rowKeyMetaData[PhoenixDatabaseMetaData.TABLE_NAME_INDEX];
-
+            // no need to run OrpanCleaner (which cleans up orphaned views) while creating SYSTEM tables  env.getTable
+            if (Bytes.compareTo(schemaName,PhoenixDatabaseMetaData.SYSTEM_SCHEMA_NAME_BYTES)!=0) {
+	            HTableInterface systemCatalog = null;
+	            try {
+	            	// can't use SchemaUtil.getPhysicalTableName on server side as we don't know whether 
+	            	// the system tables have been migrated to the system namespaces
+	            	TableName systemCatalogTableName = env.getRegion().getTableDesc().getTableName();
+	                systemCatalog = env.getTable(systemCatalogTableName);
+	                OrphanCleaner.reapOrphans(systemCatalog, tenantIdBytes, schemaName, tableName);
+	            } finally {
+	                if (systemCatalog != null) {
+	                    systemCatalog.close();
+	                }
+	            }
+            }
+            boolean isNamespaceMapped = MetaDataUtil.isNameSpaceMapped(tableMetadata, GenericKeyValueBuilder.INSTANCE,
+                    new ImmutableBytesWritable());
+            final IndexType indexType = MetaDataUtil.getIndexType(tableMetadata, GenericKeyValueBuilder.INSTANCE,
+                    new ImmutableBytesWritable());
             byte[] parentSchemaName = null;
             byte[] parentTableName = null;
             PTableType tableType = MetaDataUtil.getTableType(tableMetadata, GenericKeyValueBuilder.INSTANCE, new ImmutableBytesWritable());
+            ViewType viewType = MetaDataUtil.getViewType(tableMetadata, GenericKeyValueBuilder.INSTANCE, new ImmutableBytesWritable());
+
+            // Here we are passed the parent's columns to add to a view, PHOENIX-3534 allows for a splittable
+            // System.Catalog thus we only store the columns that are new to the view, not the parents columns,
+            // thus here we remove everything that is ORDINAL.POSITION <= baseColumnCount and update the
+            // ORDINAL.POSITIONS to be shifted accordingly.
+            if (PTableType.VIEW.equals(tableType) && !ViewType.MAPPED.equals(viewType)) {
+            	boolean isSalted = MetaDataUtil.getSaltBuckets(tableMetadata, GenericKeyValueBuilder.INSTANCE, new ImmutableBytesWritable()) > 0;
+				int baseColumnCount = MetaDataUtil.getBaseColumnCount(tableMetadata) - (isSalted ? 1 : 0);
+                if (baseColumnCount > 0) {
+                    Iterator<Mutation> mutationIterator = tableMetadata.iterator();
+                    while (mutationIterator.hasNext()) {
+                        Mutation mutation = mutationIterator.next();
+                        // if not null and ordinal position < base column count remove this mutation
+                        ImmutableBytesWritable ptr = new ImmutableBytesWritable();
+                        MetaDataUtil.getMutationValue(mutation, PhoenixDatabaseMetaData.ORDINAL_POSITION_BYTES,
+                            GenericKeyValueBuilder.INSTANCE, ptr);
+                        if (MetaDataUtil.getMutationValue(mutation, PhoenixDatabaseMetaData.ORDINAL_POSITION_BYTES,
+                            GenericKeyValueBuilder.INSTANCE, ptr)) {
+                            int ordinalValue = PInteger.INSTANCE.getCodec().decodeInt(ptr, SortOrder.ASC);
+                            if (ordinalValue <= baseColumnCount) {
+                                mutationIterator.remove();
+                            } else {
+                                if (mutation instanceof Put) {
+                                    byte[] ordinalPositionBytes = new byte[PInteger.INSTANCE.getByteSize()];
+                                    int newOrdinalValue = ordinalValue - baseColumnCount;
+                                    PInteger.INSTANCE.getCodec()
+                                        .encodeInt(newOrdinalValue, ordinalPositionBytes, 0);
+                                    byte[] family = Iterables.getOnlyElement(mutation.getFamilyCellMap().keySet());
+                                    MetaDataUtil.mutatePutValue((Put) mutation, family, PhoenixDatabaseMetaData.ORDINAL_POSITION_BYTES, ordinalPositionBytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             byte[] parentTableKey = null;
             Mutation viewPhysicalTableRow = null;
+            Set<TableName> indexes = new HashSet<TableName>();;
+            byte[] cPhysicalName = SchemaUtil.getPhysicalHBaseTableName(schemaName, tableName, isNamespaceMapped)
+                    .getBytes();
+            byte[] cParentPhysicalName=null;
             if (tableType == PTableType.VIEW) {
-                byte[][] parentSchemaTableNames = new byte[2][];
+                byte[][] parentSchemaTableNames = new byte[3][];
+                byte[][] parentPhysicalSchemaTableNames = new byte[3][];
                 /*
                  * For a view, we lock the base physical table row. For a mapped view, there is 
                  * no link present to the physical table. So the viewPhysicalTableRow is null
                  * in that case.
                  */
-                viewPhysicalTableRow = getPhysicalTableForView(tableMetadata, parentSchemaTableNames);
-                parentSchemaName = parentSchemaTableNames[0];
-                parentTableName = parentSchemaTableNames[1];
-                if (parentTableName != null) {
-                    parentTableKey = SchemaUtil.getTableKey(ByteUtil.EMPTY_BYTE_ARRAY, parentSchemaName, parentTableName);
+                
+                viewPhysicalTableRow = getPhysicalTableRowForView(tableMetadata, parentSchemaTableNames,parentPhysicalSchemaTableNames);
+                long clientTimeStamp = MetaDataUtil.getClientTimeStamp(tableMetadata);
+                if (parentPhysicalSchemaTableNames[2] != null) {
+                    
+                    parentTableKey = SchemaUtil.getTableKey(ByteUtil.EMPTY_BYTE_ARRAY,
+                            parentPhysicalSchemaTableNames[1], parentPhysicalSchemaTableNames[2]);
+                    PTable parentTable = loadTable(env, parentTableKey, new ImmutableBytesPtr(parentTableKey),
+                            clientTimeStamp, clientTimeStamp, clientVersion);
+                    if (parentTable == null) {
+                        builder.setReturnCode(MetaDataProtos.MutationCode.PARENT_TABLE_NOT_FOUND);
+                        builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
+                        done.run(builder.build());
+                        return;
+                    }
+                    cParentPhysicalName = parentTable.getPhysicalName().getBytes();
+                    if (parentSchemaTableNames[2] != null
+                            && Bytes.compareTo(parentSchemaTableNames[2], parentPhysicalSchemaTableNames[2]) != 0) {
+                        // if view is created on view
+                        byte[] parentKey = SchemaUtil.getTableKey(
+                                parentSchemaTableNames[0] == null ? ByteUtil.EMPTY_BYTE_ARRAY : parentSchemaTableNames[0],
+                                parentSchemaTableNames[1], parentSchemaTableNames[2]);
+                        parentTable = loadTable(env, parentKey, new ImmutableBytesPtr(parentKey),
+                                clientTimeStamp, clientTimeStamp, clientVersion);
+                        if (parentTable == null) {
+                            // it could be a global view
+                            parentKey = SchemaUtil.getTableKey(ByteUtil.EMPTY_BYTE_ARRAY,
+                                    parentSchemaTableNames[1], parentSchemaTableNames[2]);
+                            parentTable = loadTable(env, parentKey, new ImmutableBytesPtr(parentKey),
+                                    clientTimeStamp, clientTimeStamp, clientVersion);
+                        }
+                    }
+                    if (parentTable == null) {
+                        builder.setReturnCode(MetaDataProtos.MutationCode.PARENT_TABLE_NOT_FOUND);
+                        builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
+                        done.run(builder.build());
+                        return;
+                    }
+                    for (PTable index : parentTable.getIndexes()) {
+                        indexes.add(TableName.valueOf(index.getPhysicalName().getBytes()));
+                    }
+
+                } else {
+                    // Mapped View
+                    cParentPhysicalName = SchemaUtil.getTableNameAsBytes(schemaName, tableName);
                 }
+                parentSchemaName = parentPhysicalSchemaTableNames[1];
+                parentTableName = parentPhysicalSchemaTableNames[2];
+                    
             } else if (tableType == PTableType.INDEX) {
                 parentSchemaName = schemaName;
                 /* 
                  * For an index we lock the parent table's row which could be a physical table or a view.
                  * If the parent table is a physical table, then the tenantIdBytes is empty because
                  * we allow creating an index with a tenant connection only if the parent table is a view.
-                 */ 
+                 */
                 parentTableName = MetaDataUtil.getParentTableName(tableMetadata);
                 parentTableKey = SchemaUtil.getTableKey(tenantIdBytes, parentSchemaName, parentTableName);
+                long clientTimeStamp = MetaDataUtil.getClientTimeStamp(tableMetadata);
+                PTable parentTable = loadTable(env, parentTableKey, new ImmutableBytesPtr(parentTableKey),
+                        clientTimeStamp, clientTimeStamp, clientVersion);
+                if (IndexType.LOCAL == indexType) {
+                    cPhysicalName = parentTable.getPhysicalName().getBytes();
+                    cParentPhysicalName=parentTable.getPhysicalName().getBytes();
+                } else if (parentTable.getType() == PTableType.VIEW) {
+                    cPhysicalName = MetaDataUtil.getViewIndexPhysicalName(parentTable.getPhysicalName().getBytes());
+                    cParentPhysicalName = parentTable.getPhysicalName().getBytes();
+                }else{
+                    cParentPhysicalName = SchemaUtil
+                            .getPhysicalHBaseTableName(parentSchemaName, parentTableName, isNamespaceMapped).getBytes();
+                }
             }
+            
+            getCoprocessorHost().preCreateTable(Bytes.toString(tenantIdBytes),
+                    SchemaUtil.getTableName(schemaName, tableName),
+                    (tableType == PTableType.VIEW) ? null : TableName.valueOf(cPhysicalName),
+                    cParentPhysicalName == null ? null : TableName.valueOf(cParentPhysicalName), tableType,
+                    /* TODO: During inital create we may not need the family map */
+                    Collections.<byte[]> emptySet(), indexes);
 
             Region region = env.getRegion();
             List<RowLock> locks = Lists.newArrayList();
@@ -1420,15 +1815,22 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 if (parentTableName != null) {
                     // Check if the parent table resides in the same region. If not, don't worry about locking the parent table row
                     // or loading the parent table. For a view, the parent table that needs to be locked is the base physical table.
-                    // For an index on view, the view header row needs to be locked. 
+                    // For an index on view, the view header row needs to be locked.
                     result = checkTableKeyInRegion(parentTableKey, region);
                     if (result == null) {
                         acquireLock(region, parentTableKey, locks);
                         parentCacheKey = new ImmutableBytesPtr(parentTableKey);
                         parentTable = loadTable(env, parentTableKey, parentCacheKey, clientTimeStamp,
-                                clientTimeStamp);
+                                clientTimeStamp, clientVersion);
                         if (parentTable == null || isTableDeleted(parentTable)) {
                             builder.setReturnCode(MetaDataProtos.MutationCode.PARENT_TABLE_NOT_FOUND);
+                            builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
+                            done.run(builder.build());
+                            return;
+                        }
+                        // make sure we haven't gone over our threshold for indexes on this table.
+                        if (execeededIndexQuota(tableType, parentTable)) {
+                            builder.setReturnCode(MetaDataProtos.MutationCode.TOO_MANY_INDEXES);
                             builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
                             done.run(builder.build());
                             return;
@@ -1459,8 +1861,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 // Get as of latest timestamp so we can detect if we have a newer table that already
                 // exists without making an additional query
                 PTable table =
-                        loadTable(env, tableKey, cacheKey, clientTimeStamp, HConstants.LATEST_TIMESTAMP);
+                        loadTable(env, tableKey, cacheKey, clientTimeStamp, HConstants.LATEST_TIMESTAMP, clientVersion);
                 if (table != null) {
+                	table = combineColumns(table, tenantIdBytes, schemaName, tableName, clientTimeStamp, clientVersion).getFirst();
                     if (table.getTimeStamp() < clientTimeStamp) {
                         // If the table is older than the client time stamp and it's deleted,
                         // continue
@@ -1479,14 +1882,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                         return;
                     }
                 }
-                
                 // Add cell for ROW_KEY_ORDER_OPTIMIZABLE = true, as we know that new tables
                 // conform the correct row key. The exception is for a VIEW, which the client
                 // sends over depending on its base physical table.
                 if (tableType != PTableType.VIEW) {
                     UpgradeUtil.addRowKeyOrderOptimizableCell(tableMetadata, tableKey, clientTimeStamp);
                 }
-                // If the parent table of the view has the auto partition sequence name attribute, modify the 
+                // If the parent table of the view has the auto partition sequence name attribute, modify the
                 // tableMetadata and set the view statement and partition column correctly
                 if (parentTable!=null && parentTable.getAutoPartitionSeqName()!=null) {
                     long autoPartitionNum = 1;
@@ -1517,7 +1919,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                         return;
                     }
                     builder.setAutoPartitionNum(autoPartitionNum);
-                    
+
                     // set the VIEW STATEMENT column of the header row
                     Put tableHeaderPut = MetaDataUtil.getPutOnlyTableHeaderRow(tableMetadata);
                     NavigableMap<byte[], List<Cell>> familyCellMap = tableHeaderPut.getFamilyCellMap();
@@ -1534,13 +1936,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     if (!Bytes.equals(value, QueryConstants.EMPTY_COLUMN_VALUE_BYTES)) {
                         viewStatement = Bytes.add(value, Bytes.toBytes(" AND "), Bytes.toBytes(autoPartitionWhere));
                     }
-                    else { 
+                    else {
                         viewStatement = Bytes.toBytes(QueryUtil.getViewStatement(parentTable.getSchemaName().getString(), parentTable.getTableName().getString(), autoPartitionWhere));
                     }
                     Cell viewStatementCell = new KeyValue(cell.getRow(), cell.getFamily(), VIEW_STATEMENT_BYTES,
                         cell.getTimestamp(), Type.codeToType(cell.getTypeByte()), viewStatement);
                     cells.add(viewStatementCell);
-                    
+
                     // set the IS_VIEW_REFERENCED column of the auto partition column row
                     Put autoPartitionPut = MetaDataUtil.getPutOnlyAutoPartitionColumn(parentTable, tableMetadata);
                     familyCellMap = autoPartitionPut.getFamilyCellMap();
@@ -1564,7 +1966,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                             nSequenceSaltBuckets, parentTable.isNamespaceMapped() );
                         // TODO Review Earlier sequence was created at (SCN-1/LATEST_TIMESTAMP) and incremented at the client max(SCN,dataTable.getTimestamp), but it seems we should
                         // use always LATEST_TIMESTAMP to avoid seeing wrong sequence values by different connection having SCN
-                        // or not. 
+                        // or not.
                         long sequenceTimestamp = HConstants.LATEST_TIMESTAMP;
                         try {
                             connection.getQueryServices().createSequence(key.getTenantId(), key.getSchemaName(), key.getSequenceName(),
@@ -1586,6 +1988,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                             return;
                         }
                         Put tableHeaderPut = MetaDataUtil.getPutOnlyTableHeaderRow(tableMetadata);
+
                         NavigableMap<byte[], List<Cell>> familyCellMap = tableHeaderPut.getFamilyCellMap();
                         List<Cell> cells = familyCellMap.get(TABLE_FAMILY_BYTES);
                         Cell cell = cells.get(0);
@@ -1600,13 +2003,30 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     }
                 }
                 
+                // the child links are stored in a separate table SYSTEM.CHILD_LINK from 4.14 onwards
+                List<Mutation> childLinkMutations = MetaDataUtil.removeChildLinks(tableMetadata);
+                HTableInterface hTable = null;
+                try {
+                	hTable = env.getTable(SchemaUtil
+	                        .getPhysicalTableName(PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES, env.getConfiguration()));
+                    hTable.batch(childLinkMutations);
+                } catch (Throwable t) {
+                    logger.error("creating child links failed", t);
+                    ProtobufUtil.setControllerException(controller,
+                        ServerUtil.createIOException(SchemaUtil.getTableName(schemaName, tableName), t));
+                } finally {
+                    if (hTable != null) {
+                        hTable.close();
+                    }
+                }
+                
                 // TODO: Switch this to HRegion#batchMutate when we want to support indexes on the
                 // system table. Basically, we get all the locks that we don't already hold for all the
                 // tableMetadata rows. This ensures we don't have deadlock situations (ensuring
                 // primary and then index table locks are held, in that order). For now, we just don't support
                 // indexing on the system table. This is an issue because of the way we manage batch mutation
                 // in the Indexer.
-                region.mutateRowsWithLocks(tableMetadata, Collections.<byte[]> emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
+                mutateRowsWithLocks(region, tableMetadata, Collections.<byte[]> emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
 
                 // Invalidate the cache - the next getTable call will add it
                 // TODO: consider loading the table that was just created here, patching up the parent table, and updating the cache
@@ -1625,7 +2045,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 done.run(builder.build());
                 return;
             } finally {
-                region.releaseRowLocks(locks);
+                releaseRowLocks(region,locks);
             }
         } catch (Throwable t) {
             logger.error("createTable failed", t);
@@ -1634,85 +2054,63 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         }
     }
 
-    private static RowLock acquireLock(Region region, byte[] key, List<RowLock> locks)
-        throws IOException {
-        RowLock rowLock = region.getRowLock(key, false);
-        if (rowLock == null) {
-            throw new IOException("Failed to acquire lock on " + Bytes.toStringBinary(key));
-        }
-        locks.add(rowLock);
-        return rowLock;
+    private boolean execeededIndexQuota(PTableType tableType, PTable parentTable) {
+        return PTableType.INDEX == tableType && parentTable.getIndexes().size() >= maxIndexesPerTable;
     }
 
-    private static final byte[] CHILD_TABLE_BYTES = new byte[] {PTable.LinkType.CHILD_TABLE.getSerializedValue()};
-
-    private void findAllChildViews(Region region, byte[] tenantId, byte[] schemaName, byte[] tableName, TableViewFinderResult result) throws IOException {
-        TableViewFinderResult currResult = findChildViews(region, tenantId, schemaName, tableName);
-        result.addResult(currResult);
-        for (Result viewResult : currResult.getResults()) {
-            byte[][] rowViewKeyMetaData = new byte[5][];
-            getVarChars(viewResult.getRow(), 5, rowViewKeyMetaData);
-            byte[] viewtenantId = rowViewKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX];
-            byte[] viewSchema = SchemaUtil.getSchemaNameFromFullName(rowViewKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]).getBytes();
-            byte[] viewTable = SchemaUtil.getTableNameFromFullName(rowViewKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]).getBytes();
-            findAllChildViews(region, viewtenantId, viewSchema, viewTable, result);
-        }
-    }
-
-    /**
-     * @param tableName parent table's name
-     * Looks for whether child views exist for the table specified by table.
-     * TODO: should we pass a timestamp here?
-     */
-    private TableViewFinderResult findChildViews(Region region, byte[] tenantId, byte[] schemaName, byte[] tableName) throws IOException {
-        Scan scan = new Scan();
-        byte[] startRow = SchemaUtil.getTableKey(tenantId, schemaName, tableName);
-        byte[] stopRow = ByteUtil.nextKey(startRow);
-        scan.setStartRow(startRow);
-        scan.setStopRow(stopRow);
-        SingleColumnValueFilter linkFilter = new SingleColumnValueFilter(TABLE_FAMILY_BYTES, LINK_TYPE_BYTES, CompareOp.EQUAL, CHILD_TABLE_BYTES);
-        linkFilter.setFilterIfMissing(true);
-        scan.setFilter(linkFilter);
-        scan.addColumn(TABLE_FAMILY_BYTES, LINK_TYPE_BYTES);
-        scan.addColumn(TABLE_FAMILY_BYTES, PARENT_TENANT_ID_BYTES);
-        
-        // Original region-only scanner modified due to PHOENIX-1208
-        // RegionScanner scanner = region.getScanner(scan);
-        // The following *should* work, but doesn't due to HBASE-11837
-        // TableName systemCatalogTableName = region.getTableDesc().getTableName();
-        // HTableInterface hTable = env.getTable(systemCatalogTableName);
-        // These deprecated calls work around the issue
-        HTableInterface hTable = ServerUtil.getHTableForCoprocessorScan(env,
-                region.getTableDesc().getTableName().getName());
+    private void findAncestorViewsOfIndex(byte[] tenantId, byte[] schemaName, byte[] indexName, TableViewFinderResult result) throws IOException {
+        HTableInterface hTable = env.getTable(SchemaUtil
+                .getPhysicalTableName(PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES, env.getConfiguration()));
         try {
-            boolean allViewsInCurrentRegion = true;
-            int numOfChildViews = 0;
-            List<Result> results = Lists.newArrayList();
-            ResultScanner scanner = hTable.getScanner(scan);
-            try {
-                for (Result result = scanner.next(); (result != null); result = scanner.next()) {
-                    numOfChildViews++;
-                    ImmutableBytesWritable ptr = new ImmutableBytesWritable();
-                    ResultTuple resultTuple = new ResultTuple(result);
-                    resultTuple.getKey(ptr);
-                    byte[] key = ptr.copyBytes();
-                    if (checkTableKeyInRegion(key, region) != null) {
-                        allViewsInCurrentRegion = false;
-                    }
-                    results.add(result);
-                }
-                TableViewFinderResult tableViewFinderResult = new TableViewFinderResult(results);
-                if (numOfChildViews > 0 && !allViewsInCurrentRegion) {
-                    tableViewFinderResult.setAllViewsNotInSingleRegion();
-                }
-                return tableViewFinderResult;
-            } finally {
-                    scanner.close();
+            TableViewFinderResult currentResult = ViewFinder.findParentViewofIndex(hTable, tenantId, schemaName, indexName);
+//            currentResult.addResult(ViewFinder.findBaseTable(hTable, tenantId, schemaName, indexName));
+//            if ( currentResult.getResults().size()!=1 ) {
+//                throw new RuntimeException("View index should have exactly one parent");
+//            }
+            if (currentResult.getResults().size()==1) {
+            	result.addResult(currentResult);
+            	TableInfo tableInfo = currentResult.getResults().get(0);
+            	findAncestorViews(tableInfo.getTenantId(), tableInfo.getSchemaName(), tableInfo.getTableName(), result);
             }
+            // else this is an index on a regular table and so we don't need to combine columns
         } finally {
             hTable.close();
         }
     }
+    
+    private void findAncestorViews(byte[] tenantId, byte[] schemaName, byte[] tableName, TableViewFinderResult result) throws IOException {
+    	HTableInterface hTable = env.getTable(SchemaUtil
+                .getPhysicalTableName(PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES, env.getConfiguration()));
+        try {
+            ViewFinder.findAllRelatives(hTable, tenantId, schemaName, tableName, LinkType.PARENT_TABLE, result);
+            // TODO ask james if we need to do this for tables with namespace mapping
+            result.addResult(ViewFinder.findBaseTable(hTable, tenantId, schemaName, tableName));
+        } finally {
+            hTable.close();
+        }
+    }
+
+    private void findAllChildViews(byte[] tenantId, byte[] schemaName, byte[] tableName, TableViewFinderResult result) throws IOException {
+    	HTableInterface hTable = env.getTable(SchemaUtil
+                .getPhysicalTableName(PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES, env.getConfiguration()));
+        try {
+            ViewFinder.findAllRelatives(hTable, tenantId, schemaName, tableName, LinkType.CHILD_TABLE, result);
+        } finally {
+            hTable.close();
+        }
+    }
+    
+	private void separateLocalAndRemoteMutations(Region region, List<Mutation> mutations,
+			List<Mutation> localRegionMutations, List<Mutation> remoteRegionMutations) {
+		HRegionInfo regionInfo = region.getRegionInfo();
+		for (Mutation mutation : mutations) {
+			if (regionInfo.containsRow(mutation.getRow())) {
+				localRegionMutations.add(mutation);
+			} else {
+				remoteRegionMutations.add(mutation);
+			}
+		}
+	}
 
     @Override
     public void dropTable(RpcController controller, DropTableRequest request,
@@ -1725,8 +2123,11 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         byte[] tableName = null;
 
         try {
-            List<Mutation> tableMetadata = ProtobufUtil.getMutations(request);
-            MetaDataUtil.getTenantIdAndSchemaAndTableName(tableMetadata, rowKeyMetaData);
+            List<Mutation> catalogMutations = ProtobufUtil.getMutations(request);
+            List<Mutation> childLinkMutations = Lists.newArrayList();
+        	List<Mutation> localRegionMutations = Lists.newArrayList();
+			List<Mutation> remoteRegionMutations = Lists.newArrayList();
+            MetaDataUtil.getTenantIdAndSchemaAndTableName(catalogMutations, rowKeyMetaData);
             byte[] tenantIdBytes = rowKeyMetaData[PhoenixDatabaseMetaData.TENANT_ID_INDEX];
             schemaName = rowKeyMetaData[PhoenixDatabaseMetaData.SCHEMA_NAME_INDEX];
             tableName = rowKeyMetaData[PhoenixDatabaseMetaData.TABLE_NAME_INDEX];
@@ -1739,12 +2140,29 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             }
             List<byte[]> tableNamesToDelete = Lists.newArrayList();
             List<SharedTableState> sharedTablesToDelete = Lists.newArrayList();
-            byte[] parentTableName = MetaDataUtil.getParentTableName(tableMetadata);
+            byte[] parentTableName = MetaDataUtil.getParentTableName(catalogMutations);
             byte[] lockTableName = parentTableName == null ? tableName : parentTableName;
             byte[] lockKey = SchemaUtil.getTableKey(tenantIdBytes, schemaName, lockTableName);
             byte[] key =
                     parentTableName == null ? lockKey : SchemaUtil.getTableKey(tenantIdBytes,
                         schemaName, tableName);
+
+            
+            PTableType ptableType=PTableType.fromSerializedValue(tableType);
+            long clientTimeStamp = MetaDataUtil.getClientTimeStamp(catalogMutations);
+            byte[] cKey = SchemaUtil.getTableKey(tenantIdBytes, schemaName, tableName);
+            PTable loadedTable = loadTable(env, cKey, new ImmutableBytesPtr(cKey), clientTimeStamp, clientTimeStamp,
+                    request.getClientVersion());
+            if (loadedTable == null) {
+                builder.setReturnCode(MetaDataProtos.MutationCode.TABLE_NOT_FOUND);
+                builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
+                done.run(builder.build());
+                return;
+            }
+            getCoprocessorHost().preDropTable(Bytes.toString(tenantIdBytes),
+                    SchemaUtil.getTableName(schemaName, tableName),
+                    TableName.valueOf(loadedTable.getPhysicalName().getBytes()),
+                    getParentPhysicalTableName(loadedTable), ptableType,loadedTable.getIndexes());
 
             Region region = env.getRegion();
             MetaDataMutationResult result = checkTableKeyInRegion(key, region);
@@ -1753,7 +2171,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 return;
             }
             List<RowLock> locks = Lists.newArrayList();
-
             try {
                 acquireLock(region, lockKey, locks);
                 if (key != lockKey) {
@@ -1762,17 +2179,26 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 List<ImmutableBytesPtr> invalidateList = new ArrayList<ImmutableBytesPtr>();
                 result =
                         doDropTable(key, tenantIdBytes, schemaName, tableName, parentTableName,
-                            PTableType.fromSerializedValue(tableType), tableMetadata,
-                            invalidateList, locks, tableNamesToDelete, sharedTablesToDelete, isCascade);
+                            PTableType.fromSerializedValue(tableType), catalogMutations, childLinkMutations,
+                            invalidateList, tableNamesToDelete, sharedTablesToDelete, isCascade, request.getClientVersion());
                 if (result.getMutationCode() != MutationCode.TABLE_ALREADY_EXISTS) {
                     done.run(MetaDataMutationResult.toProto(result));
                     return;
                 }
-                Cache<ImmutableBytesPtr,PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
-                // Commit the list of deletion.
-                region.mutateRowsWithLocks(tableMetadata, Collections.<byte[]> emptySet(), HConstants.NO_NONCE,
-                    HConstants.NO_NONCE);
-                long currentTime = MetaDataUtil.getClientTimeStamp(tableMetadata);
+				Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env)
+						.getMetaDataCache();
+				// since the mutations in catalogMutations can span multiple
+				// regions first we first process process mutations local to
+				// this region, then we process the remaining mutations, finally
+				// we process the child link mutations if any of the mutations
+				// fail, we can will clean them up later using
+				// OrphanCleaner.reapOrphans()
+				separateLocalAndRemoteMutations(region, catalogMutations, localRegionMutations, remoteRegionMutations);
+				// drop rows from catalog on this region
+				mutateRowsWithLocks(region, localRegionMutations, Collections.<byte[]> emptySet(), HConstants.NO_NONCE,
+						HConstants.NO_NONCE);
+
+                long currentTime = MetaDataUtil.getClientTimeStamp(catalogMutations);
                 for (ImmutableBytesPtr ckey : invalidateList) {
                     metaDataCache.put(ckey, newDeletedTableMarker(currentTime));
                 }
@@ -1783,7 +2209,11 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 done.run(MetaDataMutationResult.toProto(result));
                 return;
             } finally {
-                region.releaseRowLocks(locks);
+                releaseRowLocks(region, locks);
+                // drop rows from catalog on remote regions
+                processMutations(controller, PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES, SchemaUtil.getTableName(schemaName, tableName), remoteRegionMutations);
+                // drop all child links 
+                processMutations(controller, PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES, SchemaUtil.getTableName(schemaName, tableName), childLinkMutations);
             }
         } catch (Throwable t) {
           logger.error("dropTable failed", t);
@@ -1791,14 +2221,121 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 ServerUtil.createIOException(SchemaUtil.getTableName(schemaName, tableName), t));
         }
     }
+    
+    protected void releaseRowLocks(Region region, List<RowLock> locks) {
+        if (locks != null) {
+            region.releaseRowLocks(locks);
+        }
+    }
 
-    private MetaDataMutationResult doDropTable(byte[] key, byte[] tenantId, byte[] schemaName,
-        byte[] tableName, byte[] parentTableName, PTableType tableType, List<Mutation> rowsToDelete,
-        List<ImmutableBytesPtr> invalidateList, List<RowLock> locks,
-        List<byte[]> tableNamesToDelete, List<SharedTableState> sharedTablesToDelete, boolean isCascade) throws IOException, SQLException {
+    private RowLock acquireLock(Region region, byte[] lockKey, List<RowLock> locks) throws IOException {
+        RowLock rowLock = region.getRowLock(lockKey, false);
+        if (rowLock == null) {
+            throw new IOException("Failed to acquire lock on " + Bytes.toStringBinary(lockKey));
+        }
+        if (locks != null) {
+            locks.add(rowLock);
+        }
+        return rowLock;
+    }
 
+	private void processMutations(RpcController controller, byte[] systemTableName, String droppedTableName,
+			List<Mutation> childLinkMutations) throws IOException {
+		HTableInterface hTable = null;
+		try {
+			hTable = env.getTable(SchemaUtil.getPhysicalTableName(systemTableName, env.getConfiguration()));
+			hTable.batch(childLinkMutations);
+		} catch (Throwable t) {
+			logger.error("dropTable failed", t);
+			ProtobufUtil.setControllerException(controller, ServerUtil.createIOException(droppedTableName, t));
+		} finally {
+			if (hTable != null) {
+				hTable.close();
+			}
+		}
+	}
+	
+	public class ScannerAdaptor {
+		private boolean useHTable;
+		private RegionScanner regionScanner;
+		private ResultScanner resultScanner;
+		private List<Cell> results;
+		Result result;
+		
+		public ScannerAdaptor(Scan scan, Region region, boolean useHTable) throws IOException {
+			this.useHTable = useHTable;
+			this.results = Lists.newArrayList();
+			if (useHTable) {
+				HTableInterface hTable = env.getTable(SchemaUtil
+		                .getPhysicalTableName(PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES, env.getConfiguration()));
+				resultScanner = hTable.getScanner(scan);
+			} else {
+				regionScanner = region.getScanner(scan);
+			}
+		}
+		
+		public boolean next() throws IOException {
+			if (useHTable) {
+				result = resultScanner.next();
+				if (result==null) {
+					return false;
+				}
+			} else {
+				results.clear();
+				regionScanner.next(results);
+				if (results.isEmpty()) {
+					return false;
+				}
+			}
+			return true;
+		}
+		
+		public Delete getRowDelete(long clientTimestamp) {
+			if (useHTable) {
+				return  new Delete(result.getRow(), clientTimestamp);
+			} else {
+				Cell cell = results.get(0);
+				Delete delete = new Delete(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength(), clientTimestamp);
+				return delete;
+			}
+		}
+		
+		public Cell getLinkType() {
+			if (useHTable) {
+				return result.getColumnLatest(TABLE_FAMILY_BYTES, LINK_TYPE_BYTES);
+			} else {
+				Cell kv = results.get(LINK_TYPE_INDEX);
+				if (Bytes.compareTo(kv.getQualifierArray(), kv.getQualifierOffset(), kv.getQualifierLength(),
+						LINK_TYPE_BYTES, 0, LINK_TYPE_BYTES.length) == 0) {
+					return kv;
+				}
+                return null;
+			}
+		}
+		
+		public Cell getParentTenantId() {
+			if (useHTable) {
+				return result.getColumnLatest(TABLE_FAMILY_BYTES, PARENT_TENANT_ID_BYTES);
+			} else {
+				return MetaDataUtil.getCell(results, PARENT_TENANT_ID_BYTES);
+			}
+		}
+		
+		public void close() throws IOException {
+			if (useHTable) {
+				resultScanner.close();
+			} else {
+				regionScanner.close();
+			}
+		}
+	}
 
-        long clientTimeStamp = MetaDataUtil.getClientTimeStamp(rowsToDelete);
+	private MetaDataMutationResult doDropTable(byte[] key, byte[] tenantId, byte[] schemaName, byte[] tableName,
+			byte[] parentTableName, PTableType tableType, List<Mutation> catalogMutations,
+			List<Mutation> childLinkMutations, List<ImmutableBytesPtr> invalidateList, List<byte[]> tableNamesToDelete,
+			List<SharedTableState> sharedTablesToDelete, boolean isCascade, int clientVersion)
+			throws IOException, SQLException {
+        long clientTimeStamp = MetaDataUtil.getClientTimeStamp(catalogMutations);
 
         Region region = env.getRegion();
         ImmutableBytesPtr cacheKey = new ImmutableBytesPtr(key);
@@ -1808,7 +2345,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
 
         // We always cache the latest version - fault in if not in cache
         if (table != null
-                || (table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP)) != null) {
+                || (table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP, clientVersion)) != null) {
             if (table.getTimeStamp() < clientTimeStamp) {
                 if (isTableDeleted(table) || tableType != table.getType()) {
                     return new MetaDataMutationResult(MutationCode.TABLE_NOT_FOUND, EnvironmentEdgeManager.currentTimeMillis(), null);
@@ -1835,87 +2372,43 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         // use the table to generate the Delete markers.
         Scan scan = MetaDataUtil.newTableRowsScan(key, MIN_TABLE_TIMESTAMP, clientTimeStamp);
         List<byte[]> indexNames = Lists.newArrayList();
-        List<Cell> results = Lists.newArrayList();
-        try (RegionScanner scanner = region.getScanner(scan);) {
-            scanner.next(results);
-            if (results.isEmpty()) { // Should not be possible
+        RegionScanner scanner = region.getScanner(scan);
+        boolean regionHasRow = region.getRegionInfo().containsRow(key);
+        ScannerAdaptor scannerAdaptor = new ScannerAdaptor(scan, region, !regionHasRow);
+        try {
+        	if (!scannerAdaptor.next()) {
                 return new MetaDataMutationResult(MutationCode.TABLE_NOT_FOUND,
                         EnvironmentEdgeManager.currentTimeMillis(), null);
             }
 
-            if (tableType == PTableType.TABLE || tableType == PTableType.SYSTEM) {
-                // Handle any child views that exist
-                TableViewFinderResult tableViewFinderResult = findChildViews(region, tenantId, table.getSchemaName().getBytes(), table.getTableName().getBytes());
-                if (tableViewFinderResult.hasViews()) {
-                    if (isCascade) {
-                        if (tableViewFinderResult.allViewsInMultipleRegions()) {
-                            // We don't yet support deleting a table with views where SYSTEM.CATALOG has split and the
-                            // view metadata spans multiple regions
-                            return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
-                                    EnvironmentEdgeManager.currentTimeMillis(), null);
-                        } else if (tableViewFinderResult.allViewsInSingleRegion()) {
-                            // Recursively delete views - safe as all the views as all in the same region
-                            for (Result viewResult : tableViewFinderResult.getResults()) {
-                                byte[][] rowViewKeyMetaData = new byte[5][];
-                                getVarChars(viewResult.getRow(), 5, rowViewKeyMetaData);
-                                byte[] viewTenantId = rowViewKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX];
-                                byte[] viewSchemaName = SchemaUtil.getSchemaNameFromFullName(rowViewKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]).getBytes();
-                                byte[] viewName = SchemaUtil.getTableNameFromFullName(rowViewKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]).getBytes();
-                                byte[] viewKey = SchemaUtil.getTableKey(viewTenantId, viewSchemaName, viewName);
-                                Delete delete = new Delete(viewKey, clientTimeStamp);
-                                rowsToDelete.add(delete);
-                                acquireLock(region, viewKey, locks);
-                                MetaDataMutationResult result = doDropTable(viewKey, viewTenantId, viewSchemaName,
-                                        viewName, null, PTableType.VIEW, rowsToDelete, invalidateList, locks,
-                                        tableNamesToDelete, sharedTablesToDelete, false);
-                                if (result.getMutationCode() != MutationCode.TABLE_ALREADY_EXISTS) { return result; }
-                            }
-                        }
-                    } else {
-                        // DROP without CASCADE on tables with child views is not permitted
-                        return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
-                                EnvironmentEdgeManager.currentTimeMillis(), null);
-                    }
-                }
-            }
-
-            // Add to list of HTables to delete, unless it's a view or its a shared index
-            if (tableType != PTableType.VIEW && table.getViewIndexId()==null) { 
-                tableNamesToDelete.add(table.getPhysicalName().getBytes());
-            }
-            else {
-                sharedTablesToDelete.add(new SharedTableState(table));
-            }
-            invalidateList.add(cacheKey);
-            byte[][] rowKeyMetaData = new byte[5][];
+			MetaDataMutationResult result = processChildViews(tenantId, catalogMutations, childLinkMutations,
+					invalidateList, tableNamesToDelete, sharedTablesToDelete, isCascade, clientVersion, clientTimeStamp,
+					cacheKey, table);
+			 if (result.getMutationCode() != MutationCode.TABLE_ALREADY_EXISTS) {
+                 return result;
+             }
             do {
-                Cell kv = results.get(LINK_TYPE_INDEX);
-                int nColumns = getVarChars(kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(), 0, rowKeyMetaData);
-                if (nColumns == 5
-                        && rowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX].length > 0
-                        && Bytes.compareTo(kv.getQualifierArray(), kv.getQualifierOffset(), kv.getQualifierLength(),
-                                LINK_TYPE_BYTES, 0, LINK_TYPE_BYTES.length) == 0) {
-                        LinkType linkType = LinkType.fromSerializedValue(kv.getValueArray()[kv.getValueOffset()]);
-                        if (rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX].length == 0 && linkType == LinkType.INDEX_TABLE) {
+            	Cell linkTypeCell = scannerAdaptor.getLinkType();
+                if (linkTypeCell!=null) {
+                        LinkType linkType = LinkType.fromSerializedValue(linkTypeCell.getValueArray()[linkTypeCell.getValueOffset()]);
+                        if (linkType == LinkType.INDEX_TABLE) {
+                        	byte[][] rowKeyMetaData = new byte[5][];
+                            getVarChars(linkTypeCell.getRowArray(), linkTypeCell.getRowOffset(), linkTypeCell.getRowLength(), 0, rowKeyMetaData);
                             indexNames.add(rowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]);
-                        } else if (linkType == LinkType.PARENT_TABLE || linkType == LinkType.PHYSICAL_TABLE) {
+                        } else if (table.getType() == PTableType.VIEW && (linkType == LinkType.PARENT_TABLE || linkType == LinkType.PHYSICAL_TABLE)) {
                             // delete parent->child link for views
-                            Cell parentTenantIdCell = MetaDataUtil.getCell(results, PhoenixDatabaseMetaData.PARENT_TENANT_ID_BYTES);
+                            Cell parentTenantIdCell = scannerAdaptor.getParentTenantId();
                             PName parentTenantId = parentTenantIdCell!=null ? PNameFactory.newName(parentTenantIdCell.getValueArray(), parentTenantIdCell.getValueOffset(), parentTenantIdCell.getValueLength()) : null;
                             byte[] linkKey = MetaDataUtil.getChildLinkKey(parentTenantId, table.getParentSchemaName(), table.getParentTableName(), table.getTenantId(), table.getName());
                             Delete linkDelete = new Delete(linkKey, clientTimeStamp);
-                            rowsToDelete.add(linkDelete);
+                            childLinkMutations.add(linkDelete);
                         }
                 }
-                // FIXME: Remove when unintentionally deprecated method is fixed (HBASE-7870).
-                // FIXME: the version of the Delete constructor without the lock args was introduced
-                // in 0.94.4, thus if we try to use it here we can no longer use the 0.94.2 version
-                // of the client.
-                Delete delete = new Delete(kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(), clientTimeStamp);
-                rowsToDelete.add(delete);
-                results.clear();
-                scanner.next(results);
-            } while (!results.isEmpty());
+                catalogMutations.add(scannerAdaptor.getRowDelete(clientTimeStamp));
+            } while (scannerAdaptor.next());
+        }
+        finally {
+        	scanner.close();
         }
         
         // Recursively delete indexes
@@ -1926,11 +2419,10 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             // in 0.94.4, thus if we try to use it here we can no longer use the 0.94.2 version
             // of the client.
             Delete delete = new Delete(indexKey, clientTimeStamp);
-            rowsToDelete.add(delete);
-            acquireLock(region, indexKey, locks);
+            catalogMutations.add(delete);
             MetaDataMutationResult result =
                     doDropTable(indexKey, tenantId, schemaName, indexName, tableName, PTableType.INDEX,
-                        rowsToDelete, invalidateList, locks, tableNamesToDelete, sharedTablesToDelete, false);
+                        catalogMutations, childLinkMutations, invalidateList, tableNamesToDelete, sharedTablesToDelete, false, clientVersion);
             if (result.getMutationCode() != MutationCode.TABLE_ALREADY_EXISTS) {
                 return result;
             }
@@ -1940,15 +2432,62 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 EnvironmentEdgeManager.currentTimeMillis(), table, tableNamesToDelete);
     }
 
+	private MetaDataMutationResult processChildViews(byte[] tenantId, List<Mutation> catalogMutations,
+			List<Mutation> childLinkMutations, List<ImmutableBytesPtr> invalidateList, List<byte[]> tableNamesToDelete,
+			List<SharedTableState> sharedTablesToDelete, boolean isCascade, int clientVersion, long clientTimeStamp,
+			ImmutableBytesPtr cacheKey, PTable table) throws IOException, SQLException {
+		PTableType tableType = table.getType();
+		if (tableType == PTableType.VIEW || tableType == PTableType.TABLE || tableType == PTableType.SYSTEM) {
+		    // Handle any child views that exist
+		    TableViewFinderResult tableViewFinderResult = new TableViewFinderResult();
+		    findAllChildViews(tenantId, table.getSchemaName().getBytes(), table.getTableName().getBytes(), tableViewFinderResult);
+		    if (tableViewFinderResult.hasViews()) {
+		        if (isCascade) {
+		            // Recursively delete views adding the mutations to delete child views to rowsToDelete
+		            for (TableInfo tableInfo : tableViewFinderResult.getResults()) {
+		                byte[] viewTenantId = tableInfo.getTenantId();
+		                byte[] viewSchemaName = tableInfo.getSchemaName();
+		                byte[] viewName = tableInfo.getTableName();
+		                byte[] viewKey = tableInfo.getRowKeyPrefix();
+		                Delete delete = new Delete(tableInfo.getRowKeyPrefix(), clientTimeStamp);
+		                catalogMutations.add(delete);
+		                MetaDataMutationResult result = doDropTable(viewKey, viewTenantId, viewSchemaName,
+		                        viewName, null, PTableType.VIEW, catalogMutations, childLinkMutations, invalidateList,
+		                        tableNamesToDelete, sharedTablesToDelete, isCascade, clientVersion);
+		                if (result.getMutationCode() != MutationCode.TABLE_ALREADY_EXISTS) {
+		                    return result;
+		                }
+		            }
+		        } else {
+		            // DROP without CASCADE on tables with child views is not permitted
+		            return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
+		                    EnvironmentEdgeManager.currentTimeMillis(), null);
+		        }
+		    }
+		}
+
+		// Add to list of HTables to delete, unless it's a view or its a shared index
+		if (tableType != PTableType.VIEW && table.getViewIndexId()==null) {
+		    tableNamesToDelete.add(table.getPhysicalName().getBytes());
+		}
+		else {
+		    sharedTablesToDelete.add(new SharedTableState(table));
+		}
+		invalidateList.add(cacheKey);
+		return new MetaDataMutationResult(MutationCode.TABLE_ALREADY_EXISTS,
+                EnvironmentEdgeManager.currentTimeMillis(), null);
+	}
+
+
     private static interface ColumnMutator {
-      MetaDataMutationResult updateMutation(PTable table, byte[][] rowKeyMetaData,
-          List<Mutation> tableMetadata, Region region,
-          List<ImmutableBytesPtr> invalidateList, List<RowLock> locks, long clientTimeStamp) throws IOException,
-          SQLException;
+        MetaDataMutationResult updateMutation(PTable table, byte[][] rowKeyMetaData,
+            List<Mutation> tableMetadata, Region region,
+            List<ImmutableBytesPtr> invalidateList, List<RowLock> locks, long clientTimeStamp) throws IOException,
+            SQLException;
     }
 
     private MetaDataMutationResult
-    mutateColumn(List<Mutation> tableMetadata, ColumnMutator mutator) throws IOException {
+    mutateColumn(List<Mutation> tableMetadata, ColumnMutator mutator, int clientVersion) throws IOException {
         byte[][] rowKeyMetaData = new byte[5][];
         MetaDataUtil.getTenantIdAndSchemaAndTableName(tableMetadata, rowKeyMetaData);
         byte[] tenantId = rowKeyMetaData[PhoenixDatabaseMetaData.TENANT_ID_INDEX];
@@ -1963,7 +2502,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             }
             List<RowLock> locks = Lists.newArrayList();
             try {
-                acquireLock(region, key, locks);
+            	acquireLock(region, key, locks);
                 ImmutableBytesPtr cacheKey = new ImmutableBytesPtr(key);
                 List<ImmutableBytesPtr> invalidateList = new ArrayList<ImmutableBytesPtr>();
                 invalidateList.add(cacheKey);
@@ -1982,7 +2521,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 // Get client timeStamp from mutations
                 long clientTimeStamp = MetaDataUtil.getClientTimeStamp(tableMetadata);
                 if (table == null
-                        && (table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP)) == null) {
+                        && (table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP, clientVersion)) == null) {
                     // if not found then call newerTableExists and add delete marker for timestamp
                     // found
                     table = buildDeletedTable(key, cacheKey, region, clientTimeStamp);
@@ -1995,18 +2534,15 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                             EnvironmentEdgeManager.currentTimeMillis(), null);
                 }
                 if (table.getTimeStamp() >= clientTimeStamp) {
-                    logger.info("Found newer table as of " + table.getTimeStamp() + " versus client timestamp of " + clientTimeStamp);
+                    logger.info("Found newer table as of " + table.getTimeStamp() + " versus client timestamp of "
+                            + clientTimeStamp);
                     return new MetaDataMutationResult(MutationCode.NEWER_TABLE_FOUND,
                             EnvironmentEdgeManager.currentTimeMillis(), table);
-                } else if (isTableDeleted(table)) {
-                    return new MetaDataMutationResult(MutationCode.TABLE_NOT_FOUND,
-                            EnvironmentEdgeManager.currentTimeMillis(), null);
-                }
-
-                long expectedSeqNum = MetaDataUtil.getSequenceNumber(tableMetadata) - 1; // lookup
-                                                                                         // TABLE_SEQ_NUM
-                                                                                         // in
+                } else if (isTableDeleted(table)) { return new MetaDataMutationResult(MutationCode.TABLE_NOT_FOUND,
+                        EnvironmentEdgeManager.currentTimeMillis(), null); }
+                long expectedSeqNum = MetaDataUtil.getSequenceNumber(tableMetadata) - 1; // lookup TABLE_SEQ_NUM in
                                                                                          // tableMetaData
+
                 if (logger.isDebugEnabled()) {
                     logger.debug("For table " + Bytes.toStringBinary(key) + " expecting seqNum "
                             + expectedSeqNum + " and found seqNum " + table.getSequenceNumber()
@@ -2041,7 +2577,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 if (result != null && result.getMutationCode()!=MutationCode.TABLE_ALREADY_EXISTS) {
                     return result;
                 }
-                region.mutateRowsWithLocks(tableMetadata, Collections.<byte[]> emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
+                mutateRowsWithLocks(region, tableMetadata, Collections.<byte[]> emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
                 // Invalidate from cache
                 for (ImmutableBytesPtr invalidateKey : invalidateList) {
                     metaDataCache.invalidate(invalidateKey);
@@ -2053,22 +2589,23 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 if (result !=null) {
                     return result;
                 } else {
-                    table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP);
+                    table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP, clientVersion);
+                    table = combineColumns(table, tenantId, schemaName, tableName, clientTimeStamp, clientVersion).getFirst();
                     return new MetaDataMutationResult(MutationCode.TABLE_ALREADY_EXISTS, currentTime, table);
                 }
             } finally {
-                region.releaseRowLocks(locks);
+                releaseRowLocks(region,locks);
             }
         } catch (Throwable t) {
             ServerUtil.throwIOException(SchemaUtil.getTableName(schemaName, tableName), t);
             return null; // impossible
         }
     }
-    
+
     private final class PutWithOrdinalPosition implements Comparable<PutWithOrdinalPosition>{
         private final Put put;
         private final int ordinalPosition;
-        
+
         public PutWithOrdinalPosition(Put put, int ordinalPos) {
             this.put = put;
             this.ordinalPosition = ordinalPos;
@@ -2079,17 +2616,17 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             return (this.ordinalPosition < o.ordinalPosition ? -1 : this.ordinalPosition > o.ordinalPosition ? 1 : 0);
         }
     }
-    
+
     private static int getOrdinalPosition(PTable table, PColumn col) {
         return table.getBucketNum() == null ? col.getPosition() + 1 : col.getPosition();
     }
-    
+
     private static boolean isDivergedView(PTable view) {
         return view.getBaseColumnCount() == QueryConstants.DIVERGED_VIEW_BASE_COLUMN_COUNT;
     }
-    
+
     /**
-     * 
+     *
      * Class to keep track of columns and their ordinal positions as we
      * process through the list of columns to be added.
      *
@@ -2097,11 +2634,11 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     private static class ColumnOrdinalPositionUpdateList {
         final List<byte[]> columnKeys = new ArrayList<>(10);
         int offset;
-        
+
         int size()  {
             return columnKeys.size();
         }
-        
+
         private void setOffset(int lowestOrdinalPos) {
             this.offset = lowestOrdinalPos;
         }
@@ -2123,7 +2660,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 columnKeys.remove(index);
             }
         }
-        
+
         private void addColumn(byte[] columnKey, int position) {
             checkArgument(position >= this.offset);
             int index = position - offset;
@@ -2158,12 +2695,12 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 columnKeys.set(index, columnKey);
             }
         }
-        
+
         private int getOrdinalPositionFromListIdx(int listIndex) {
             checkArgument(listIndex < columnKeys.size());
             return listIndex + offset;
         }
-        
+
         /**
          * @param columnKey
          * @return if present - the ordinal position of the column in this list.
@@ -2180,11 +2717,11 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             return -1;
         }
     }
-    
+
     private static byte[] getColumnKey(byte[] viewKey, PColumn column) {
         return getColumnKey(viewKey, column.getName().getString(), column.getFamilyName() != null ? column.getFamilyName().getString() : null);
     }
-    
+
     private static byte[] getColumnKey(byte[] viewKey, String columnName, String columnFamily) {
         byte[] columnKey = ByteUtil.concat(viewKey, QueryConstants.SEPARATOR_BYTE_ARRAY,
                 Bytes.toBytes(columnName));
@@ -2194,7 +2731,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         }
         return columnKey;
     }
-    
+
     private boolean switchAttribute(PTable table, boolean currAttribute, List<Mutation> tableMetaData, byte[] attrQualifier) {
         for (Mutation m : tableMetaData) {
             if (m instanceof Put) {
@@ -2202,43 +2739,56 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 List<Cell> cells = p.get(TABLE_FAMILY_BYTES, attrQualifier);
                 if (cells != null && cells.size() > 0) {
                     Cell cell = cells.get(0);
-                    boolean newAttribute = (boolean)PBoolean.INSTANCE.toObject(cell.getValueArray(), cell.getValueOffset(), cell.getValueLength()); 
+                    boolean newAttribute = (boolean)PBoolean.INSTANCE.toObject(cell.getValueArray(), cell.getValueOffset(), cell.getValueLength());
                     return currAttribute != newAttribute;
                 }
             }
         }
         return false;
     }
-    
-    private MetaDataMutationResult addColumnsAndTablePropertiesToChildViews(PTable basePhysicalTable, List<Mutation> tableMetadata, List<Mutation> mutationsForAddingColumnsToViews, byte[] schemaName, byte[] tableName,
-            List<ImmutableBytesPtr> invalidateList, long clientTimeStamp, TableViewFinderResult childViewsResult,
-            Region region, List<RowLock> locks) throws IOException, SQLException {
-        List<PutWithOrdinalPosition> columnPutsForBaseTable = Lists.newArrayListWithExpectedSize(tableMetadata.size());
-        Map<TableProperty, Cell> tablePropertyCellMap = Maps.newHashMapWithExpectedSize(tableMetadata.size());
-        // Isolate the puts relevant to adding columns. Also figure out what kind of columns are being added.
+
+
+    private MetaDataMutationResult validateColumnForAddToBaseTable(PTable basePhysicalTable,
+            List<Mutation> tableMetadata, byte[][] rowKeyMetaData,
+            TableViewFinderResult childViewsResult, long clientTimeStamp, int clientVersion)
+            throws IOException, SQLException {
+        byte[] schemaName = rowKeyMetaData[SCHEMA_NAME_INDEX];
+        byte[] tableName = rowKeyMetaData[TABLE_NAME_INDEX];
+        List<PutWithOrdinalPosition> columnPutsForBaseTable =
+                Lists.newArrayListWithExpectedSize(tableMetadata.size());
+        Map<TableProperty, Cell> tablePropertyCellMap =
+                Maps.newHashMapWithExpectedSize(tableMetadata.size());
+        // Isolate the puts relevant to adding columns. Also figure out what kind of columns are
+        // being added.
         for (Mutation m : tableMetadata) {
             if (m instanceof Put) {
                 byte[][] rkmd = new byte[5][];
                 int pkCount = getVarChars(m.getRow(), rkmd);
                 // check if this put is for adding a column
-                if (pkCount > COLUMN_NAME_INDEX
-                        && rkmd[COLUMN_NAME_INDEX] != null && rkmd[COLUMN_NAME_INDEX].length > 0
+                if (pkCount > COLUMN_NAME_INDEX && rkmd[COLUMN_NAME_INDEX] != null
+                        && rkmd[COLUMN_NAME_INDEX].length > 0
                         && Bytes.compareTo(schemaName, rkmd[SCHEMA_NAME_INDEX]) == 0
                         && Bytes.compareTo(tableName, rkmd[TABLE_NAME_INDEX]) == 0) {
-                    columnPutsForBaseTable.add(new PutWithOrdinalPosition((Put)m, getInteger((Put)m, TABLE_FAMILY_BYTES, ORDINAL_POSITION_BYTES)));
+                    columnPutsForBaseTable.add(new PutWithOrdinalPosition((Put) m,
+                            getInteger((Put) m, TABLE_FAMILY_BYTES, ORDINAL_POSITION_BYTES)));
                 }
                 // check if the put is for a table property
                 else if (pkCount <= COLUMN_NAME_INDEX
                         && Bytes.compareTo(schemaName, rkmd[SCHEMA_NAME_INDEX]) == 0
                         && Bytes.compareTo(tableName, rkmd[TABLE_NAME_INDEX]) == 0) {
-                    for (Cell cell : m.getFamilyCellMap().get(QueryConstants.DEFAULT_COLUMN_FAMILY_BYTES)) {
+                    for (Cell cell : m.getFamilyCellMap()
+                            .get(QueryConstants.DEFAULT_COLUMN_FAMILY_BYTES)) {
                         for (TableProperty tableProp : TableProperty.values()) {
                             byte[] propNameBytes = Bytes.toBytes(tableProp.getPropertyName());
-                            if (Bytes.compareTo(propNameBytes, 0, propNameBytes.length, cell.getQualifierArray(), cell.getQualifierOffset(), cell.getQualifierLength())==0
-                                    && tableProp.isValidOnView() && tableProp.isMutable()) {
-                                Cell tablePropCell = CellUtil.createCell(cell.getRow(), CellUtil.cloneFamily(cell),
-                                    CellUtil.cloneQualifier(cell), cell.getTimestamp(), cell.getTypeByte(),
-                                    CellUtil.cloneValue(cell));
+                            if (Bytes.compareTo(propNameBytes, 0, propNameBytes.length,
+                                cell.getQualifierArray(), cell.getQualifierOffset(),
+                                cell.getQualifierLength()) == 0 && tableProp.isValidOnView()
+                                    && tableProp.isMutable()) {
+                                Cell tablePropCell =
+                                        CellUtil.createCell(cell.getRow(),
+                                            CellUtil.cloneFamily(cell),
+                                            CellUtil.cloneQualifier(cell), cell.getTimestamp(),
+                                            cell.getTypeByte(), CellUtil.cloneValue(cell));
                                 tablePropertyCellMap.put(tableProp, tablePropCell);
                             }
                         }
@@ -2246,278 +2796,133 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 }
             }
         }
-        // Sort the puts by ordinal position 
+        // Sort the puts by ordinal position
         Collections.sort(columnPutsForBaseTable);
-        for (Result viewResult : childViewsResult.getResults()) {
-            short deltaNumPkColsSoFar = 0;
-            short columnsAddedToView = 0;
-            short columnsAddedToBaseTable = 0;
-            byte[][] rowViewKeyMetaData = new byte[5][];
-            getVarChars(viewResult.getRow(), 5, rowViewKeyMetaData);
-            byte[] tenantId = rowViewKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX];
-            byte[] schema = SchemaUtil.getSchemaNameFromFullName(rowViewKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]).getBytes();
-            byte[] table = SchemaUtil.getTableNameFromFullName(rowViewKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]).getBytes();
-            byte[] viewKey = SchemaUtil.getTableKey(tenantId, schema, table);
-            
-            // lock the rows corresponding to views so that no other thread can modify the view meta-data
-            RowLock viewRowLock = acquireLock(region, viewKey, locks);
-            PTable view = doGetTable(viewKey, clientTimeStamp, viewRowLock);
-            
-            ColumnOrdinalPositionUpdateList ordinalPositionList = new ColumnOrdinalPositionUpdateList();
+        for (TableInfo viewInfo : childViewsResult.getResults()) {
+            byte[] viewKey = SchemaUtil.getTableKey(viewInfo.getTenantId(), viewInfo.getSchemaName(), viewInfo.getTableName());
+            PTable view = doGetTable(viewKey, clientTimeStamp, clientVersion);
+
+            // add the new columns to the child view
             List<PColumn> viewPkCols = new ArrayList<>(view.getPKColumns());
             boolean addingExistingPkCol = false;
-            int numCols = view.getColumns().size();
-            // add the new columns to the child view
             for (PutWithOrdinalPosition p : columnPutsForBaseTable) {
-                Put baseTableColumnPut = p.put;
+                Put columnToBeAdded = p.put;
                 PColumn existingViewColumn = null;
                 byte[][] rkmd = new byte[5][];
-                getVarChars(baseTableColumnPut.getRow(), rkmd);
+                getVarChars(columnToBeAdded.getRow(), rkmd);
                 String columnName = Bytes.toString(rkmd[COLUMN_NAME_INDEX]);
-                String columnFamily = rkmd[FAMILY_NAME_INDEX] == null ? null : Bytes.toString(rkmd[FAMILY_NAME_INDEX]);
+                String columnFamily =
+                        rkmd[FAMILY_NAME_INDEX] == null ? null
+                                : Bytes.toString(rkmd[FAMILY_NAME_INDEX]);
                 try {
-                    existingViewColumn = columnFamily == null ? view.getColumnForColumnName(columnName) : view.getColumnFamily(
-                            columnFamily).getPColumnForColumnName(columnName);
+                    existingViewColumn =
+                            columnFamily == null ? view.getColumnForColumnName(columnName)
+                                    : view.getColumnFamily(columnFamily)
+                                            .getPColumnForColumnName(columnName);
                 } catch (ColumnFamilyNotFoundException e) {
-                    // ignore since it means that the column family is not present for the column to be added.
+                    // ignore since it means that the column family is not present for the column to
+                    // be added.
                 } catch (ColumnNotFoundException e) {
                     // ignore since it means the column is not present in the view
                 }
-                
-                boolean isPkCol = columnFamily == null;
-                byte[] columnKey = getColumnKey(viewKey, columnName, columnFamily);
+
+                boolean isColumnToBeAddPkCol = columnFamily == null;
                 if (existingViewColumn != null) {
-                    MetaDataMutationResult result = validateColumnForAddToBaseTable(existingViewColumn, baseTableColumnPut, basePhysicalTable, isPkCol, view);
-                    if (result != null) {
-                        return result;
-                    }
-                    if (isPkCol) {
-                        viewPkCols.remove(existingViewColumn);
-                        addingExistingPkCol = true;
-                    }
-                    /*
-                     * For views that are not diverged, we need to make sure that the existing columns
-                     * have the same ordinal position as in the base table. This is important because
-                     * we rely on the ordinal position of the column to figure out whether dropping a 
-                     * column from the view will end up diverging the view from the base table.
-                     * 
-                     * For already diverged views, we don't care about the ordinal position of the existing column.
-                     */
-                    if (!isDivergedView(view)) {
-                        int newOrdinalPosition = p.ordinalPosition;
-                        // Check if the ordinal position of the column was getting updated from previous add column
-                        // mutations.
-                        int existingOrdinalPos = ordinalPositionList.getOrdinalPositionOfColumn(columnKey);
-                        if (ordinalPositionList.size() == 0) {
-                            /*
-                             * No ordinal positions to be updated are in the list. In that case, check whether the
-                             * existing ordinal position of the column is different from its new ordinal position.
-                             * If yes, then initialize the ordinal position list with this column's ordinal position
-                             * as the offset.
-                             */
-                            existingOrdinalPos = getOrdinalPosition(view, existingViewColumn);
-                            if (existingOrdinalPos != newOrdinalPosition) {
-                                ordinalPositionList.setOffset(newOrdinalPosition);
-                                ordinalPositionList.addColumn(columnKey, newOrdinalPosition);
-                                for (PColumn col : view.getColumns()) {
-                                    int ordinalPos = getOrdinalPosition(view, col);
-                                    if (ordinalPos >= newOrdinalPosition) {
-                                        if (ordinalPos == existingOrdinalPos) {
-                                            /*
-                                             * No need to update ordinal positions of columns beyond the existing column's 
-                                             * old ordinal position.
-                                             */
-                                            break;
-                                        }
-                                        // increment ordinal position of columns occurring after this column by 1
-                                        int updatedPos = ordinalPos + 1;
-                                        ordinalPositionList.addColumn(getColumnKey(viewKey, col), updatedPos);
-                                    } 
-                                }
-                            } 
-                        } else {
-                            if (existingOrdinalPos != newOrdinalPosition) {
-                                ordinalPositionList.addColumn(columnKey, newOrdinalPosition);
-                            }
-                        }
-                        columnsAddedToBaseTable++;
-                    }
-                } else {
-                    // The column doesn't exist in the view.
-                    Put viewColumnPut = new Put(columnKey, clientTimeStamp);
-                    for (Cell cell : baseTableColumnPut.getFamilyCellMap().values().iterator().next()) {
-                        viewColumnPut.add(CellUtil.createCell(columnKey, CellUtil.cloneFamily(cell),
-                                CellUtil.cloneQualifier(cell), cell.getTimestamp(), cell.getTypeByte(),
-                                CellUtil.cloneValue(cell)));
-                    }
-                    if (isDivergedView(view)) {
-                        if (isPkCol) {
-                            /* 
-                             * Only pk cols of the base table are added to the diverged views. These pk 
-                             * cols are added at the end.
-                             */
-                            int lastOrdinalPos = getOrdinalPosition(view, view.getColumns().get(numCols - 1));
-                            int newPosition = ++lastOrdinalPos;
-                            byte[] ptr = new byte[PInteger.INSTANCE.getByteSize()];
-                            PInteger.INSTANCE.getCodec().encodeInt(newPosition, ptr, 0);
-                            viewColumnPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                                    PhoenixDatabaseMetaData.ORDINAL_POSITION_BYTES, clientTimeStamp, ptr);
-                            mutationsForAddingColumnsToViews.add(viewColumnPut);
-                        } else {
-                            continue; // move on to the next column
-                        }
-                    } else {
-                        int newOrdinalPosition = p.ordinalPosition;
+                    if (EncodedColumnsUtil.usesEncodedColumnNames(basePhysicalTable)
+                            && !SchemaUtil.isPKColumn(existingViewColumn)) {
                         /*
-                         * For a non-diverged view, we need to make sure that the base table column
-                         * is added at the right position.
+                         * If the column already exists in a view, then we cannot add the column to
+                         * the base table. The reason is subtle and is as follows: consider the case
+                         * where a table has two views where both the views have the same key value
+                         * column KV. Now, we dole out encoded column qualifiers for key value
+                         * columns in views by using the counters stored in the base physical table.
+                         * So the KV column can have different column qualifiers for the two views.
+                         * For example, 11 for VIEW1 and 12 for VIEW2. This naturally extends to
+                         * rows being inserted using the two views having different column
+                         * qualifiers for the column named KV. Now, when an attempt is made to add
+                         * column KV to the base table, we cannot decide which column qualifier
+                         * should that column be assigned. It cannot be a number different than 11
+                         * or 12 since a query like SELECT KV FROM BASETABLE would return null for
+                         * KV which is incorrect since column KV is present in rows inserted from
+                         * the two views. We cannot use 11 or 12 either because we will then
+                         * incorrectly return value of KV column inserted using only one view.
                          */
-                        if (ordinalPositionList.size() == 0) {
-                            ordinalPositionList.setOffset(newOrdinalPosition);
-                            ordinalPositionList.addColumn(columnKey, newOrdinalPosition);
-                            for (PColumn col : view.getColumns()) {
-                                int ordinalPos = getOrdinalPosition(view, col);
-                                if (ordinalPos >= newOrdinalPosition) {
-                                    // increment ordinal position of columns by 1
-                                    int updatedPos = ordinalPos + 1;
-                                    ordinalPositionList.addColumn(getColumnKey(viewKey, col), updatedPos);
-                                } 
+                        return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
+                                EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
+                    }
+                    // Validate data type is same
+                    int baseColumnDataType =
+                            getInteger(columnToBeAdded, TABLE_FAMILY_BYTES, DATA_TYPE_BYTES);
+                    if (baseColumnDataType != existingViewColumn.getDataType().getSqlType()) {
+                        return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
+                                EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
+                    }
+
+                    // Validate max length is same
+                    int maxLength =
+                            getInteger(columnToBeAdded, TABLE_FAMILY_BYTES, COLUMN_SIZE_BYTES);
+                    int existingMaxLength =
+                            existingViewColumn.getMaxLength() == null ? 0
+                                    : existingViewColumn.getMaxLength();
+                    if (maxLength != existingMaxLength) {
+                        return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
+                                EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
+                    }
+
+                    // Validate scale is same
+                    int scale =
+                            getInteger(columnToBeAdded, TABLE_FAMILY_BYTES, DECIMAL_DIGITS_BYTES);
+                    int existingScale =
+                            existingViewColumn.getScale() == null ? 0
+                                    : existingViewColumn.getScale();
+                    if (scale != existingScale) {
+                        return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
+                                EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
+                    }
+
+                    // Validate sort order is same
+                    int sortOrder =
+                            getInteger(columnToBeAdded, TABLE_FAMILY_BYTES, SORT_ORDER_BYTES);
+                    if (sortOrder != existingViewColumn.getSortOrder().getSystemValue()) {
+                        return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
+                                EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
+                    }
+
+                    // if the column to be added to the base table is a pk column, then we need to
+                    // validate that the key slot position is the same
+                    if (isColumnToBeAddPkCol) {
+                        List<Cell> keySeqCells =
+                                columnToBeAdded.get(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
+                                    PhoenixDatabaseMetaData.KEY_SEQ_BYTES);
+                        if (keySeqCells != null && keySeqCells.size() > 0) {
+                            Cell cell = keySeqCells.get(0);
+                            int keySeq =
+                                    PSmallint.INSTANCE.getCodec().decodeInt(cell.getValueArray(),
+                                        cell.getValueOffset(), SortOrder.getDefault());
+                            int pkPosition = basePhysicalTable.getPKColumns().size() + SchemaUtil.getPKPosition(view, existingViewColumn) + 1;
+                            if (pkPosition != keySeq) {
+                                return new MetaDataMutationResult(
+                                        MutationCode.UNALLOWED_TABLE_MUTATION,
+                                        EnvironmentEdgeManager.currentTimeMillis(),
+                                        basePhysicalTable);
                             }
-                        } else {
-                            ordinalPositionList.addColumn(columnKey, newOrdinalPosition);
                         }
-                        mutationsForAddingColumnsToViews.add(viewColumnPut);
                     }
-                    if (isPkCol) {
-                        deltaNumPkColsSoFar++;
-                        // Set the key sequence for the pk column to be added
-                        short currentKeySeq = SchemaUtil.getMaxKeySeq(view);
-                        short newKeySeq = (short)(currentKeySeq + deltaNumPkColsSoFar);
-                        byte[] keySeqBytes = new byte[PSmallint.INSTANCE.getByteSize()];
-                        PSmallint.INSTANCE.getCodec().encodeShort(newKeySeq, keySeqBytes, 0);
-                        viewColumnPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                                PhoenixDatabaseMetaData.KEY_SEQ_BYTES, keySeqBytes);
-                        addMutationsForAddingPkColsToViewIndexes(mutationsForAddingColumnsToViews, clientTimeStamp, view,
-                                deltaNumPkColsSoFar, columnName, viewColumnPut);
-                    }
-                    columnsAddedToView++;
-                    columnsAddedToBaseTable++;
+                }
+                if (isColumnToBeAddPkCol) {
+                    viewPkCols.remove(existingViewColumn);
+                    addingExistingPkCol = true;
                 }
             }
             /*
              * Allow adding a pk columns to base table : 1. if all the view pk columns are exactly the same as the base
              * table pk columns 2. if we are adding all the existing view pk columns to the base table
              */ 
-            if (addingExistingPkCol && !viewPkCols.equals(basePhysicalTable.getPKColumns())) {
+            if (addingExistingPkCol && !viewPkCols.isEmpty()) {
                 return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
             }
-            addViewIndexesHeaderRowMutations(mutationsForAddingColumnsToViews, invalidateList, clientTimeStamp, view,
-                    deltaNumPkColsSoFar);
-            
-            // set table properties in child view
-            if (!tablePropertyCellMap.isEmpty()) {
-                Put viewHeaderRowPut = new Put(viewKey, clientTimeStamp);
-                for (TableProperty tableProp : TableProperty.values()) {
-                    Cell tablePropertyCell = tablePropertyCellMap.get(tableProp);
-                    if ( tablePropertyCell != null) {
-                        // set this table property on the view if it is not mutable on a view (which means the property is always the same as the base table)
-                        // or if it is mutable on a view and the property value is the same as the base table property (which means it wasn't changed on the view)
-                        if (!tableProp.isMutableOnView() || tableProp.getPTableValue(view).equals(tableProp.getPTableValue(basePhysicalTable))) {
-                            viewHeaderRowPut.add(CellUtil.createCell(viewKey, CellUtil.cloneFamily(tablePropertyCell),
-                                CellUtil.cloneQualifier(tablePropertyCell), clientTimeStamp, tablePropertyCell.getTypeByte(),
-                                CellUtil.cloneValue(tablePropertyCell)));
-                        }
-                    }
-                }
-                byte[] viewSequencePtr = new byte[PLong.INSTANCE.getByteSize()];
-                PLong.INSTANCE.getCodec().encodeLong(view.getSequenceNumber() + 1, viewSequencePtr, 0);
-                viewHeaderRowPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.TABLE_SEQ_NUM_BYTES, clientTimeStamp, viewSequencePtr);
-                // invalidate the view so that it is removed from the cache
-                invalidateList.add(new ImmutableBytesPtr(viewKey));
-
-                mutationsForAddingColumnsToViews.add(viewHeaderRowPut);
-            }
-            
-            /*
-             * Increment the sequence number by 1 if:
-             * 1) For a diverged view, there were columns (pk columns) added to the view.
-             * 2) For a non-diverged view if the base column count changed.
-             */
-            boolean changeSequenceNumber = (isDivergedView(view) && columnsAddedToView > 0)
-                    || (!isDivergedView(view) && columnsAddedToBaseTable > 0);
-            updateViewHeaderRow(basePhysicalTable, tableMetadata, mutationsForAddingColumnsToViews,
-                invalidateList, clientTimeStamp, columnsAddedToView, columnsAddedToBaseTable,
-                viewKey, view, ordinalPositionList, numCols, changeSequenceNumber);
         }
         return null;
-    }
-
-    /**
-     * Updates the base table column count, column count, sequence number and ordinal postions of
-     * columns of the view based on the columns being added or dropped.
-     */
-    private void updateViewHeaderRow(PTable basePhysicalTable, List<Mutation> tableMetadata,
-            List<Mutation> mutationsForAddingColumnsToViews,
-            List<ImmutableBytesPtr> invalidateList, long clientTimeStamp, short viewColumnDelta,
-            short baseTableColumnDelta, byte[] viewKey, PTable view,
-            ColumnOrdinalPositionUpdateList ordinalPositionList, int numCols, boolean changeSequenceNumber) {
-        // Update the view header rows with new column counts.
-        Put viewHeaderRowPut = new Put(viewKey, clientTimeStamp);
-        if (!isDivergedView(view) && baseTableColumnDelta != 0) {
-            // Base column count should only be updated for diverged views.
-            int oldBaseColumnCount = view.getBaseColumnCount();
-            byte[] baseColumnCountPtr = new byte[PInteger.INSTANCE.getByteSize()];
-            PInteger.INSTANCE.getCodec().encodeInt(oldBaseColumnCount + baseTableColumnDelta, baseColumnCountPtr, 0);
-            viewHeaderRowPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.BASE_COLUMN_COUNT_BYTES, clientTimeStamp, baseColumnCountPtr);
-        }
-        
-        if (viewColumnDelta != 0) {
-            byte[] columnCountPtr = new byte[PInteger.INSTANCE.getByteSize()];
-            PInteger.INSTANCE.getCodec().encodeInt(numCols + viewColumnDelta, columnCountPtr, 0);
-            viewHeaderRowPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.COLUMN_COUNT_BYTES, clientTimeStamp, columnCountPtr);
-        }
-        
-        if (changeSequenceNumber) {
-            byte[] viewSequencePtr = new byte[PLong.INSTANCE.getByteSize()];
-            PLong.INSTANCE.getCodec().encodeLong(view.getSequenceNumber() + 1, viewSequencePtr, 0);
-            viewHeaderRowPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.TABLE_SEQ_NUM_BYTES, clientTimeStamp, viewSequencePtr);
-
-            mutationsForAddingColumnsToViews.add(viewHeaderRowPut);
-
-            // only invalidate if the sequence number is about to change
-            invalidateList.add(new ImmutableBytesPtr(viewKey));
-
-            // Update the ordinal positions. The list would be non-empty only if the sequence
-            // number will change.
-            int i = 0;
-            for (byte[] columnKey : ordinalPositionList.columnKeys) {
-                int ordinalPosition = ordinalPositionList.getOrdinalPositionFromListIdx(i);
-                Put positionUpdatePut = new Put(columnKey, clientTimeStamp);
-                byte[] ptr = new byte[PInteger.INSTANCE.getByteSize()];
-                PInteger.INSTANCE.getCodec().encodeInt(ordinalPosition, ptr, 0);
-                positionUpdatePut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.ORDINAL_POSITION_BYTES, clientTimeStamp, ptr);
-                mutationsForAddingColumnsToViews.add(positionUpdatePut);
-                i++;
-            }
-        }
-        
-        if (view.rowKeyOrderOptimizable()) {
-            UpgradeUtil.addRowKeyOrderOptimizableCell(mutationsForAddingColumnsToViews, viewKey, clientTimeStamp);
-        }
-        
-        // if switching from from non tx to tx
-        if (!basePhysicalTable.isTransactional() && switchAttribute(basePhysicalTable, basePhysicalTable.isTransactional(), tableMetadata, TRANSACTIONAL_BYTES)) {
-        	invalidateList.add(new ImmutableBytesPtr(viewKey));
-        	Put put = new Put(viewKey);
-            put.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-            		TRANSACTIONAL_BYTES, clientTimeStamp, PBoolean.INSTANCE.toBytes(true));
-            mutationsForAddingColumnsToViews.add(put);
-        }
     }
     
     private class ColumnFinder extends StatelessTraverseAllExpressionVisitor<Void> {
@@ -2555,185 +2960,90 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             return columnFound;
         }
     }
-
-    private MetaDataMutationResult dropColumnsFromChildViews(Region region,
-            PTable basePhysicalTable, List<RowLock> locks, List<Mutation> tableMetadata,
-            List<Mutation> mutationsForAddingColumnsToViews, byte[] schemaName, byte[] tableName,
-            List<ImmutableBytesPtr> invalidateList, long clientTimeStamp,
-            TableViewFinderResult childViewsResult, List<byte[]> tableNamesToDelete, List<SharedTableState> sharedTablesToDelete)
-            throws IOException, SQLException {
-        List<Delete> columnDeletesForBaseTable = new ArrayList<>(tableMetadata.size());
-        // Isolate the deletes relevant to dropping columns. Also figure out what kind of columns
-        // are being added.
-        for (Mutation m : tableMetadata) {
-            if (m instanceof Delete) {
-                byte[][] rkmd = new byte[5][];
-                int pkCount = getVarChars(m.getRow(), rkmd);
-                if (pkCount > COLUMN_NAME_INDEX
-                        && Bytes.compareTo(schemaName, rkmd[SCHEMA_NAME_INDEX]) == 0
-                        && Bytes.compareTo(tableName, rkmd[TABLE_NAME_INDEX]) == 0) {
-                    columnDeletesForBaseTable.add((Delete) m);
-                }
-            }
-        }
-        for (Result viewResult : childViewsResult.getResults()) {
-            short numColsDeleted = 0;
-            byte[][] rowViewKeyMetaData = new byte[5][];
-            getVarChars(viewResult.getRow(), 5, rowViewKeyMetaData);
-            byte[] viewTenantId = rowViewKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX];
-            byte[] viewSchemaName = SchemaUtil.getSchemaNameFromFullName(rowViewKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]).getBytes();
-            byte[] viewName = SchemaUtil.getTableNameFromFullName(rowViewKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]).getBytes();
-            byte[] viewKey = SchemaUtil.getTableKey(viewTenantId, viewSchemaName, viewName);
-
-            // lock the rows corresponding to views so that no other thread can modify the view
-            // meta-data
-            RowLock viewRowLock = acquireLock(region, viewKey, locks);
-            PTable view = doGetTable(viewKey, clientTimeStamp, viewRowLock);
-
-            ColumnOrdinalPositionUpdateList ordinalPositionList =
-                    new ColumnOrdinalPositionUpdateList();
-            int numCols = view.getColumns().size();
-            int minDroppedColOrdinalPos = Integer.MAX_VALUE;
-            for (Delete columnDeleteForBaseTable : columnDeletesForBaseTable) {
-                PColumn existingViewColumn = null;
-                byte[][] rkmd = new byte[5][];
-                getVarChars(columnDeleteForBaseTable.getRow(), rkmd);
-                String columnName = Bytes.toString(rkmd[COLUMN_NAME_INDEX]);
-                String columnFamily =
-                        rkmd[FAMILY_NAME_INDEX] == null ? null : Bytes
-                                .toString(rkmd[FAMILY_NAME_INDEX]);
-                byte[] columnKey = getColumnKey(viewKey, columnName, columnFamily);
-                try {
-                    existingViewColumn =
-                            columnFamily == null ? view.getColumnForColumnName(columnName) : view
-                                    .getColumnFamily(columnFamily).getPColumnForColumnName(columnName);
-                } catch (ColumnFamilyNotFoundException e) {
-                    // ignore since it means that the column family is not present for the column to
-                    // be added.
-                } catch (ColumnNotFoundException e) {
-                    // ignore since it means the column is not present in the view
-                }
-
-                // check if the view where expression contains the column being dropped and prevent
-                // it
-                if (existingViewColumn != null && view.getViewStatement() != null) {
-                    ParseNode viewWhere =
-                            new SQLParser(view.getViewStatement()).parseQuery().getWhere();
-                    PhoenixConnection conn=null;
-                    try {
-                        conn = QueryUtil.getConnectionOnServer(env.getConfiguration()).unwrap(
-                            PhoenixConnection.class);
-                    } catch (ClassNotFoundException e) {
-                    }
-                    PhoenixStatement statement = new PhoenixStatement(conn);
-                    TableRef baseTableRef = new TableRef(basePhysicalTable);
-                    ColumnResolver columnResolver = FromCompiler.getResolver(baseTableRef);
-                    StatementContext context = new StatementContext(statement, columnResolver);
-                    Expression whereExpression = WhereCompiler.compile(context, viewWhere);
-                    Expression colExpression =
-                            new ColumnRef(baseTableRef, existingViewColumn.getPosition())
-                                    .newColumnExpression();
-                    ColumnFinder columnFinder = new ColumnFinder(colExpression);
-                    whereExpression.accept(columnFinder);
-                    if (columnFinder.getColumnFound()) {
-                        return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
-                                EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
-                    }
-                }
-
-                minDroppedColOrdinalPos =
-                        Math.min(getOrdinalPosition(view, existingViewColumn),
-                            minDroppedColOrdinalPos);
-                if (existingViewColumn != null) {
-                    --numColsDeleted;
-                    if (ordinalPositionList.size() == 0) {
-                        ordinalPositionList.setOffset(view.getBucketNum() == null ? 1 : 0);
-                        for (PColumn col : view.getColumns()) {
-                            ordinalPositionList.addColumn(getColumnKey(viewKey, col));
-                        }
-                    }
-                    ordinalPositionList.dropColumn(columnKey);
-                    Delete viewColumnDelete = new Delete(columnKey, clientTimeStamp);
-                    mutationsForAddingColumnsToViews.add(viewColumnDelete);
-                    // drop any view indexes that need this column
-                    dropIndexes(view, region, invalidateList, locks, clientTimeStamp,
-                        schemaName, view.getName().getBytes(),
-                        mutationsForAddingColumnsToViews, existingViewColumn,
-                        tableNamesToDelete, sharedTablesToDelete);
-                }
-            }
-
-            updateViewHeaderRow(basePhysicalTable, tableMetadata, mutationsForAddingColumnsToViews,
-                invalidateList, clientTimeStamp, numColsDeleted, numColsDeleted, viewKey, view,
-                ordinalPositionList, numCols, true);
-        }
-        return null;
-    }
     
-    private MetaDataMutationResult validateColumnForAddToBaseTable(PColumn existingViewColumn, Put columnToBeAdded, PTable basePhysicalTable, boolean isColumnToBeAddPkCol, PTable view) {
-        if (existingViewColumn != null) {
-            if (EncodedColumnsUtil.usesEncodedColumnNames(basePhysicalTable) && !SchemaUtil.isPKColumn(existingViewColumn)) {
-                /*
-                 * If the column already exists in a view, then we cannot add the column to the base
-                 * table. The reason is subtle and is as follows: consider the case where a table
-                 * has two views where both the views have the same key value column KV. Now, we
-                 * dole out encoded column qualifiers for key value columns in views by using the
-                 * counters stored in the base physical table. So the KV column can have different
-                 * column qualifiers for the two views. For example, 11 for VIEW1 and 12 for VIEW2.
-                 * This naturally extends to rows being inserted using the two views having
-                 * different column qualifiers for the column named KV. Now, when an attempt is made
-                 * to add column KV to the base table, we cannot decide which column qualifier
-                 * should that column be assigned. It cannot be a number different than 11 or 12
-                 * since a query like SELECT KV FROM BASETABLE would return null for KV which is
-                 * incorrect since column KV is present in rows inserted from the two views. We
-                 * cannot use 11 or 12 either because we will then incorrectly return value of KV
-                 * column inserted using only one view.
-                 */
-                return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
-            }
-            // Validate data type is same
-            int baseColumnDataType = getInteger(columnToBeAdded, TABLE_FAMILY_BYTES, DATA_TYPE_BYTES);
-            if (baseColumnDataType != existingViewColumn.getDataType().getSqlType()) {
-                return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
-            }
+//    private MetaDataMutationResult dropViewsOrViewIndexesIfNeeded(Region region,
+//            PTable basePhysicalTable, List<Mutation> tableMetadata,
+//            List<Mutation> mutationsForAddingColumnsToViews, byte[] schemaName, byte[] tableName,
+//            List<ImmutableBytesPtr> invalidateList, long clientTimeStamp,
+//            TableViewFinderResult childViewsResult)
+//            throws IOException, SQLException {
+//        List<Delete> columnDeletesForBaseTable = new ArrayList<>(tableMetadata.size());
+//        // Isolate the deletes relevant to dropping columns. Also figure out what kind of columns
+//        // are being added.
+//        for (Mutation m : tableMetadata) {
+//            if (m instanceof Delete) {
+//                byte[][] rkmd = new byte[5][];
+//                int pkCount = getVarChars(m.getRow(), rkmd);
+//                if (pkCount > COLUMN_NAME_INDEX
+//                        && Bytes.compareTo(schemaName, rkmd[SCHEMA_NAME_INDEX]) == 0
+//                        && Bytes.compareTo(tableName, rkmd[TABLE_NAME_INDEX]) == 0) {
+//                    columnDeletesForBaseTable.add((Delete) m);
+//                }
+//            }
+//        }
+//        for (TableInfo viewInfo : childViewsResult.getResults()) {
+//        	byte[] viewKey = SchemaUtil.getTableKey(viewInfo.getTenantId(), viewInfo.getSchemaName(), viewInfo.getTableName());
+//            PTable view = doGetTable(viewKey, clientTimeStamp, null);
+//
+//            ColumnOrdinalPositionUpdateList ordinalPositionList =
+//                    new ColumnOrdinalPositionUpdateList();
+//            for (Delete columnDeleteForBaseTable : columnDeletesForBaseTable) {
+//                PColumn existingViewColumn = null;
+//                byte[][] rkmd = new byte[5][];
+//                getVarChars(columnDeleteForBaseTable.getRow(), rkmd);
+//                String columnName = Bytes.toString(rkmd[COLUMN_NAME_INDEX]);
+//                String columnFamily =
+//                        rkmd[FAMILY_NAME_INDEX] == null ? null : Bytes
+//                                .toString(rkmd[FAMILY_NAME_INDEX]);
+//                byte[] columnKey = getColumnKey(viewKey, columnName, columnFamily);
+//                try {
+//                    existingViewColumn =
+//                            columnFamily == null ? view.getColumnForColumnName(columnName) : view
+//                                    .getColumnFamily(columnFamily).getPColumnForColumnName(columnName);
+//                } catch (ColumnFamilyNotFoundException e) {
+//                    // ignore since it means that the column family is not present for the column to
+//                    // be added.
+//                } catch (ColumnNotFoundException e) {
+//                    // ignore since it means the column is not present in the view
+//                }
+//
+//                // check if the view where expression contains the column being dropped and prevent
+//                // it
+//                if (existingViewColumn != null && view.getViewStatement() != null) {
+//                    ParseNode viewWhere =
+//                            new SQLParser(view.getViewStatement()).parseQuery().getWhere();
+//                    PhoenixConnection conn=null;
+//                    try {
+//                        conn = QueryUtil.getConnectionOnServer(env.getConfiguration()).unwrap(
+//                            PhoenixConnection.class);
+//                    } catch (ClassNotFoundException e) {
+//                    }
+//                    PhoenixStatement statement = new PhoenixStatement(conn);
+//                    TableRef baseTableRef = new TableRef(basePhysicalTable);
+//                    ColumnResolver columnResolver = FromCompiler.getResolver(baseTableRef);
+//                    StatementContext context = new StatementContext(statement, columnResolver);
+//                    Expression whereExpression = WhereCompiler.compile(context, viewWhere);
+//                    Expression colExpression =
+//                            new ColumnRef(baseTableRef, existingViewColumn.getPosition())
+//                                    .newColumnExpression();
+//                    ColumnFinder columnFinder = new ColumnFinder(colExpression);
+//                    whereExpression.accept(columnFinder);
+//                    if (columnFinder.getColumnFound()) {
+//                        // drop the view
+//                    }
+//                }
+//
+//                if (existingViewColumn != null) {
+//                    // drop any view indexes that need this column
+//                    dropIndexes(view, region, invalidateList, clientTimeStamp,
+//                        schemaName, view.getName().getBytes(),
+//                        mutationsForAddingColumnsToViews, existingViewColumn);
+//                }
+//            }
+//        }
+//        return null;
+//    }
 
-            // Validate max length is same
-            int maxLength = getInteger(columnToBeAdded, TABLE_FAMILY_BYTES, COLUMN_SIZE_BYTES);
-            int existingMaxLength = existingViewColumn.getMaxLength() == null ? 0 : existingViewColumn.getMaxLength();
-            if (maxLength != existingMaxLength) {
-                return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable); 
-            }
-            
-            // Validate scale is same
-            int scale = getInteger(columnToBeAdded, TABLE_FAMILY_BYTES, DECIMAL_DIGITS_BYTES);
-            int existingScale = existingViewColumn.getScale() == null ? 0 : existingViewColumn.getScale();
-            if (scale != existingScale) {
-                return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable); 
-            }
-            
-            // Validate sort order is same
-            int sortOrder = getInteger(columnToBeAdded, TABLE_FAMILY_BYTES, SORT_ORDER_BYTES);
-            if (sortOrder != existingViewColumn.getSortOrder().getSystemValue()) {
-                return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable);
-            }
-            
-            // if the column to be added to the base table is a pk column, then we need to validate that the key slot position is the same
-            if (isColumnToBeAddPkCol) {
-                List<Cell> keySeqCells = columnToBeAdded.get(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.KEY_SEQ_BYTES);
-                if (keySeqCells != null && keySeqCells.size() > 0) {
-                    Cell cell = keySeqCells.get(0);
-                    int keySeq = PSmallint.INSTANCE.getCodec().decodeInt(cell.getValueArray(), cell.getValueOffset(),
-                            SortOrder.getDefault());
-                    int pkPosition = SchemaUtil.getPKPosition(view, existingViewColumn) + 1;
-                    if (pkPosition != keySeq) { return new MetaDataMutationResult(
-                            MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), basePhysicalTable); }
-                }
-            }
-        }
-        return null;
-    }
-    
     private int getInteger(Put p, byte[] family, byte[] qualifier) {
         List<Cell> cells = p.get(family, qualifier);
         if (cells != null && cells.size() > 0) {
@@ -2742,130 +3052,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         }
         return 0;
     }
-    
-    private void addViewIndexesHeaderRowMutations(List<Mutation> mutationsForAddingColumnsToViews,
-            List<ImmutableBytesPtr> invalidateList, long clientTimeStamp, PTable view, short deltaNumPkColsSoFar) {
-        if (deltaNumPkColsSoFar > 0) {
-            for (PTable index : view.getIndexes()) {
-                byte[] indexHeaderRowKey = getViewIndexHeaderRowKey(index);
-                Put indexHeaderRowMutation = new Put(indexHeaderRowKey);
-                
-                // increment sequence number
-                long newSequenceNumber = index.getSequenceNumber() + 1;
-                byte[] newSequenceNumberPtr = new byte[PLong.INSTANCE.getByteSize()];
-                PLong.INSTANCE.getCodec().encodeLong(newSequenceNumber, newSequenceNumberPtr, 0);
-                indexHeaderRowMutation.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.TABLE_SEQ_NUM_BYTES, newSequenceNumberPtr);
-                
-                // increase the column count
-                int newColumnCount = index.getColumns().size() + deltaNumPkColsSoFar;
-                byte[] newColumnCountPtr = new byte[PInteger.INSTANCE.getByteSize()];
-                PInteger.INSTANCE.getCodec().encodeInt(newColumnCount, newColumnCountPtr, 0);
-                indexHeaderRowMutation.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.COLUMN_COUNT_BYTES, newColumnCountPtr);
-                
-                // add index row header key to the invalidate list to force clients to fetch the latest meta-data
-                invalidateList.add(new ImmutableBytesPtr(indexHeaderRowKey));
-                if (index.rowKeyOrderOptimizable()) {
-                    UpgradeUtil.addRowKeyOrderOptimizableCell(mutationsForAddingColumnsToViews, indexHeaderRowKey, clientTimeStamp);
-                }
-                mutationsForAddingColumnsToViews.add(indexHeaderRowMutation);
-            }
-        }
-    }
 
-    private void addMutationsForAddingPkColsToViewIndexes(List<Mutation> mutationsForAddingColumnsToViews, long clientTimeStamp,
-            PTable view, short deltaNumPkColsSoFar, String viewPkColumnName, Put viewColumnDefinitionPut) {
-        for (PTable index : view.getIndexes()) {
-            int oldNumberOfColsInIndex = index.getColumns().size();
-            
-            byte[] indexColumnKey = ByteUtil.concat(getViewIndexHeaderRowKey(index), QueryConstants.SEPARATOR_BYTE_ARRAY, Bytes.toBytes(IndexUtil.getIndexColumnName(null, viewPkColumnName)));
-            Put indexColumnDefinitionPut = new Put(indexColumnKey, clientTimeStamp);
-            
-            // Set the index specific data type for the column
-            int viewPkColumnDataType = getInteger(viewColumnDefinitionPut, TABLE_FAMILY_BYTES, DATA_TYPE_BYTES);
-            byte[] indexColumnDataTypeBytes = new byte[PInteger.INSTANCE.getByteSize()];
-            int indexColumnDataType = IndexUtil.getIndexColumnDataType(true,
-                    PDataType.fromTypeId(viewPkColumnDataType)).getSqlType();
-            PInteger.INSTANCE.getCodec().encodeInt(indexColumnDataType, indexColumnDataTypeBytes, 0);
-            indexColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.DATA_TYPE_BYTES, indexColumnDataTypeBytes);
-            
-             
-            // Set precision
-            List<Cell> decimalDigits = viewColumnDefinitionPut.get(
-                    PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.DECIMAL_DIGITS_BYTES);
-            if (decimalDigits != null && decimalDigits.size() > 0) {
-                Cell decimalDigit = decimalDigits.get(0);
-                indexColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.DECIMAL_DIGITS_BYTES, decimalDigit.getValueArray());
-            }
-            
-            // Set size
-            List<Cell> columnSizes = viewColumnDefinitionPut.get(
-                    PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.COLUMN_SIZE_BYTES);
-            if (columnSizes != null && columnSizes.size() > 0) {
-                Cell columnSize = columnSizes.get(0);
-                indexColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.COLUMN_SIZE_BYTES, columnSize.getValueArray());
-            }
-            
-            // Set sort order
-            List<Cell> sortOrders = viewColumnDefinitionPut.get(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.SORT_ORDER_BYTES);
-            if (sortOrders != null && sortOrders.size() > 0) {
-                Cell sortOrder = sortOrders.get(0);
-                indexColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.SORT_ORDER_BYTES, sortOrder.getValueArray());
-            }
-            
-            // Set data table name
-            List<Cell> dataTableNames = viewColumnDefinitionPut.get(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.DATA_TABLE_NAME_BYTES);
-            if (dataTableNames != null && dataTableNames.size() > 0) {
-                Cell dataTableName = dataTableNames.get(0);
-                indexColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.DATA_TABLE_NAME_BYTES, dataTableName.getValueArray());
-            }
-            
-            // Set the ordinal position of the new column.
-            byte[] ordinalPositionBytes = new byte[PInteger.INSTANCE.getByteSize()];
-            int ordinalPositionOfNewCol = oldNumberOfColsInIndex + deltaNumPkColsSoFar;
-            PInteger.INSTANCE.getCodec().encodeInt(ordinalPositionOfNewCol, ordinalPositionBytes, 0);
-            indexColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.ORDINAL_POSITION_BYTES, ordinalPositionBytes);
-            
-            // New PK columns have to be nullable after the first DDL
-            byte[] isNullableBytes = PBoolean.INSTANCE.toBytes(true);
-            indexColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                        PhoenixDatabaseMetaData.NULLABLE_BYTES, isNullableBytes);
-            
-            // Set the key sequence for the pk column to be added
-            short currentKeySeq = SchemaUtil.getMaxKeySeq(index);
-            short newKeySeq = (short)(currentKeySeq + deltaNumPkColsSoFar);
-            byte[] keySeqBytes = new byte[PSmallint.INSTANCE.getByteSize()];
-            PSmallint.INSTANCE.getCodec().encodeShort(newKeySeq, keySeqBytes, 0);
-            indexColumnDefinitionPut.add(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                    PhoenixDatabaseMetaData.KEY_SEQ_BYTES, keySeqBytes);
-            
-            mutationsForAddingColumnsToViews.add(indexColumnDefinitionPut);
-        }
-    }
-    
-    private byte[] getViewIndexHeaderRowKey(PTable index) {
-        byte[] tenantIdBytes = index.getKey().getTenantId() != null ? index.getKey().getTenantId().getBytes() : EMPTY_BYTE_ARRAY;
-        byte[] schemaNameBytes = index.getSchemaName() != null ? index.getSchemaName().getBytes() : EMPTY_BYTE_ARRAY; 
-        byte[] tableNameBytes = index.getTableName().getBytes();
-        return ByteUtil.concat(tenantIdBytes, SEPARATOR_BYTE_ARRAY, schemaNameBytes, SEPARATOR_BYTE_ARRAY, tableNameBytes);
-    }
-    
     @Override
     public void addColumn(RpcController controller, final AddColumnRequest request,
             RpcCallback<MetaDataResponse> done) {
         try {
             List<Mutation> tableMetaData = ProtobufUtil.getMutations(request);
+
             MetaDataMutationResult result = mutateColumn(tableMetaData, new ColumnMutator() {
                 @Override
                 public MetaDataMutationResult updateMutation(PTable table, byte[][] rowKeyMetaData,
@@ -2875,45 +3068,47 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     byte[] schemaName = rowKeyMetaData[SCHEMA_NAME_INDEX];
                     byte[] tableName = rowKeyMetaData[TABLE_NAME_INDEX];
                     PTableType type = table.getType();
+                    table = combineColumns(table, tenantId, schemaName, tableName, HConstants.LATEST_TIMESTAMP, request.getClientVersion()).getFirst();
                     byte[] tableHeaderRowKey = SchemaUtil.getTableKey(tenantId,
                             schemaName, tableName);
+                    byte[] cPhysicalTableName=table.getPhysicalName().getBytes();
+                    getCoprocessorHost().preAlterTable(Bytes.toString(tenantId),
+                            SchemaUtil.getTableName(schemaName, tableName), TableName.valueOf(cPhysicalTableName),
+                            getParentPhysicalTableName(table),type);
+
                     // Size for worst case - all new columns are PK column
                     List<Mutation> mutationsForAddingColumnsToViews = Lists.newArrayListWithExpectedSize(tableMetaData.size() * ( 1 + table.getIndexes().size()));
-                    // TODO propagate to grandchild views as well
+
                     if (type == PTableType.TABLE || type == PTableType.SYSTEM) {
                         TableViewFinderResult childViewsResult = new TableViewFinderResult();
-                        findAllChildViews(region, tenantId, table.getSchemaName().getBytes(), table.getTableName().getBytes(), childViewsResult);
+                        findAllChildViews(tenantId, table.getSchemaName().getBytes(), table.getTableName().getBytes(), childViewsResult);
                         if (childViewsResult.hasViews()) {
                             /* 
                              * Dis-allow if:
-                             * 1) The meta-data for child view/s spans over
-                             * more than one region (since the changes cannot be made in a transactional fashion)
                              * 
-                             * 2) The base column count is 0 which means that the metadata hasn't been upgraded yet or
+                             * 1) The base column count is 0 which means that the metadata hasn't been upgraded yet or
                              * the upgrade is currently in progress.
                              * 
-                             * 3) If the request is from a client that is older than 4.5 version of phoenix. 
+                             * 2) If the request is from a client that is older than 4.5 version of phoenix. 
                              * Starting from 4.5, metadata requests have the client version included in them. 
                              * We don't want to allow clients before 4.5 to add a column to the base table if it has views.
                              * 
-                             * 4) Trying to swtich tenancy of a table that has views
+                             * 3) Trying to swtich tenancy of a table that has views
                              */
-                            if (!childViewsResult.allViewsInSingleRegion() 
-                                    || table.getBaseColumnCount() == 0 
+                            if (table.getBaseColumnCount() == 0 
                                     || !request.hasClientVersion()
                                     || switchAttribute(table, table.isMultiTenant(), tableMetaData, MULTI_TENANT_BYTES)) {
                                 return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
                                         EnvironmentEdgeManager.currentTimeMillis(), null);
                             } else {
-                                mutationsForAddingColumnsToViews = new ArrayList<>(childViewsResult.getResults().size() * tableMetaData.size());
-                                MetaDataMutationResult mutationResult = addColumnsAndTablePropertiesToChildViews(table, tableMetaData, mutationsForAddingColumnsToViews, schemaName, tableName, invalidateList, clientTimeStamp,
-                                        childViewsResult, region, locks);
-                                // return if we were not able to add the column successfully
+                                MetaDataMutationResult mutationResult = validateColumnForAddToBaseTable(table, tableMetaData, rowKeyMetaData, childViewsResult, clientTimeStamp, request.getClientVersion());
+                                // return if validation was not successful
                                 if (mutationResult!=null)
                                     return mutationResult;
                             } 
                         }
-                    } else if (type == PTableType.VIEW
+                    } 
+                    if (type == PTableType.VIEW
                             && EncodedColumnsUtil.usesEncodedColumnNames(table)) {
                         /*
                          * When adding a column to a view that uses encoded column name scheme, we
@@ -2923,6 +3118,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                          */
                         invalidateList.add(new ImmutableBytesPtr(MetaDataUtil
                                 .getPhysicalTableRowForView(table)));
+
+
+
                     }
                     for (Mutation m : tableMetaData) {
                         byte[] key = m.getRow();
@@ -2990,7 +3188,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                             // loops through the indexes if adding a PK column, since we'd
                             // always have header rows for those.
                             invalidateList.add(new ImmutableBytesPtr(SchemaUtil
-                                    .getTableKey(tenantId, 
+                                    .getTableKey(tenantId,
                                             rowKeyMetaData[SCHEMA_NAME_INDEX],
                                             rowKeyMetaData[TABLE_NAME_INDEX])));
                         }
@@ -2998,20 +3196,22 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     tableMetaData.addAll(mutationsForAddingColumnsToViews);
                     return null;
                 }
-            });
+            }, request.getClientVersion());
             if (result != null) {
                 done.run(MetaDataMutationResult.toProto(result));
             }
-        } catch (IOException ioe) {
-            ProtobufUtil.setControllerException(controller, ioe);
+        } catch (Throwable e) {
+            logger.error("Add column failed: ", e);
+            ProtobufUtil.setControllerException(controller,
+                ServerUtil.createIOException("Error when adding column: ", e));
         }
     }
 
-    private PTable doGetTable(byte[] key, long clientTimeStamp) throws IOException, SQLException {
-        return doGetTable(key, clientTimeStamp, null);
+    private PTable doGetTable(byte[] key, long clientTimeStamp, int clientVersion) throws IOException, SQLException {
+        return doGetTable(key, clientTimeStamp, null, clientVersion);
     }
 
-    private PTable doGetTable(byte[] key, long clientTimeStamp, RowLock rowLock) throws IOException, SQLException {
+    private PTable doGetTable(byte[] key, long clientTimeStamp, RowLock rowLock, int clientVersion) throws IOException, SQLException {
         ImmutableBytesPtr cacheKey = new ImmutableBytesPtr(key);
         Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache =
                 GlobalCache.getInstance(this.env).getMetaDataCache();
@@ -3026,53 +3226,55 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
          * from getting rebuilt too often.
          */
         final boolean wasLocked = (rowLock != null);
-        boolean blockWriteRebuildIndex = env.getConfiguration().getBoolean(QueryServices.INDEX_FAILURE_BLOCK_WRITE, 
-                QueryServicesOptions.DEFAULT_INDEX_FAILURE_BLOCK_WRITE);
         if (!wasLocked) {
-            rowLock = region.getRowLock(key, false);
-            if (rowLock == null) {
-                throw new IOException("Failed to acquire lock on " + Bytes.toStringBinary(key));
-            }
+            rowLock = acquireLock(region, key, null);
         }
         try {
-            PTable table = (PTable)metaDataCache.getIfPresent(cacheKey);
-            // We only cache the latest, so we'll end up building the table with every call if the
-            // client connection has specified an SCN.
-            // TODO: If we indicate to the client that we're returning an older version, but there's a
-            // newer version available, the client
-            // can safely not call this, since we only allow modifications to the latest.
-            if (table != null && table.getTimeStamp() < clientTimeStamp) {
-                // Table on client is up-to-date with table on server, so just return
-                if (isTableDeleted(table)) {
-                    return null;
-                }
-                return table;
-            }
-            // Try cache again in case we were waiting on a lock
-            table = (PTable)metaDataCache.getIfPresent(cacheKey);
-            // We only cache the latest, so we'll end up building the table with every call if the
-            // client connection has specified an SCN.
-            // TODO: If we indicate to the client that we're returning an older version, but there's
-            // a newer version available, the client
-            // can safely not call this, since we only allow modifications to the latest.
-            if (table != null && table.getTimeStamp() < clientTimeStamp) {
-                // Table on client is up-to-date with table on server, so just return
-                if (isTableDeleted(table)) {
-                    return null;
+            PTable table = getCachedTable(clientTimeStamp, cacheKey, metaDataCache);
+            if (table == null) {
+                // Try cache again in case we were waiting on a lock
+                table = getCachedTable(clientTimeStamp, cacheKey, metaDataCache);
+                if (table == null) {
+                    // Query for the latest table first, since it's not cached
+                    table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP, clientVersion);
+                    if ((table == null || table.getTimeStamp() >= clientTimeStamp) && (!blockWriteRebuildIndex
+                        || table.getIndexDisableTimestamp() <= 0)) {
+                        // Otherwise, query for an older version of the table - it won't be cached
+                        table = buildTable(key, cacheKey, region, clientTimeStamp, clientVersion);
+
+                    }
                 }
                 return table;
             }
             // Query for the latest table first, since it's not cached
-            table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP);
+            table = buildTable(key, cacheKey, region, HConstants.LATEST_TIMESTAMP, clientVersion);
             if ((table != null && table.getTimeStamp() < clientTimeStamp) || 
                     (blockWriteRebuildIndex && table.getIndexDisableTimestamp() > 0)) {
                 return table;
             }
             // Otherwise, query for an older version of the table - it won't be cached
-            return buildTable(key, cacheKey, region, clientTimeStamp);
+            return buildTable(key, cacheKey, region, clientTimeStamp, clientVersion);
         } finally {
             if (!wasLocked) rowLock.release();
         }
+    }
+
+    private PTable getCachedTable(long clientTimeStamp, ImmutableBytesPtr cacheKey,
+        Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache) {
+        PTable table = (PTable)metaDataCache.getIfPresent(cacheKey);
+        // We only cache the latest, so we'll end up building the table with every call if the
+        // client connection has specified an SCN.
+        // TODO: If we indicate to the client that we're returning an older version, but there's a
+        // newer version available, the client
+        // can safely not call this, since we only allow modifications to the latest.
+        if (table != null && table.getTimeStamp() < clientTimeStamp) {
+            // Table on client is up-to-date with table on server, so just return
+            if (isTableDeleted(table)) {
+                table = null;
+            }
+            return table;
+        }
+        return null;
     }
 
     private List<PFunction> doGetFunctions(List<byte[]> keys, long clientTimeStamp) throws IOException, SQLException {
@@ -3089,20 +3291,14 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
          * Lock directly on key, though it may be an index table. This will just prevent a table
          * from getting rebuilt too often.
          */
-        List<RowLock> rowLocks = new ArrayList<Region.RowLock>(keys.size());;
+        List<RowLock> rowLocks = new ArrayList<RowLock>(keys.size());;
         try {
-            rowLocks = new ArrayList<Region.RowLock>(keys.size());
             for (int i = 0; i < keys.size(); i++) {
-                Region.RowLock rowLock = region.getRowLock(keys.get(i), false);
-                if (rowLock == null) {
-                    throw new IOException("Failed to acquire lock on "
-                            + Bytes.toStringBinary(keys.get(i)));
-                }
-                rowLocks.add(rowLock);
+                acquireLock(region, keys.get(i), rowLocks);
             }
 
             List<PFunction> functionsAvailable = new ArrayList<PFunction>(keys.size());
-            int numFunctions = keys.size(); 
+            int numFunctions = keys.size();
             Iterator<byte[]> iterator = keys.iterator();
             while(iterator.hasNext()) {
                 byte[] key = iterator.next();
@@ -3128,15 +3324,27 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             if(functionsAvailable.size() == numFunctions) return functionsAvailable;
             return null;
         } finally {
-            for (Region.RowLock lock : rowLocks) {
-                lock.release();
-            }
-            rowLocks.clear();
+            releaseRowLocks(region,rowLocks);
         }
+    }
+    
+    private PColumn getColumn(int pkCount, byte[][] rowKeyMetaData, PTable table) throws ColumnFamilyNotFoundException, ColumnNotFoundException {
+    	PColumn col = null;
+        if (pkCount > FAMILY_NAME_INDEX
+            && rowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX].length > 0) {
+            PColumnFamily family =
+                table.getColumnFamily(rowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]);
+            col =
+                family.getPColumnForColumnNameBytes(rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX]);
+        } else if (pkCount > COLUMN_NAME_INDEX
+            && rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX].length > 0) {
+            col = table.getPKColumn(new String(rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX]));
+        }
+    	return col;
     }
 
     @Override
-    public void dropColumn(RpcController controller, DropColumnRequest request,
+    public void dropColumn(RpcController controller, final DropColumnRequest request,
             RpcCallback<MetaDataResponse> done) {
         List<Mutation> tableMetaData = null;
         final List<byte[]> tableNamesToDelete = Lists.newArrayList();
@@ -3149,55 +3357,51 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                         List<Mutation> tableMetaData, Region region,
                         List<ImmutableBytesPtr> invalidateList, List<RowLock> locks, long clientTimeStamp)
                         throws IOException, SQLException {
+
                     byte[] tenantId = rowKeyMetaData[TENANT_ID_INDEX];
                     byte[] schemaName = rowKeyMetaData[SCHEMA_NAME_INDEX];
                     byte[] tableName = rowKeyMetaData[TABLE_NAME_INDEX];
+                    table = combineColumns(table, tenantId, schemaName, tableName, clientTimeStamp, request.getClientVersion()).getFirst();
+                    boolean isView = table.getType() == PTableType.VIEW;
                     boolean deletePKColumn = false;
+                    getCoprocessorHost().preAlterTable(Bytes.toString(tenantId),
+                            SchemaUtil.getTableName(schemaName, tableName),
+                            TableName.valueOf(table.getPhysicalName().getBytes()),
+                            getParentPhysicalTableName(table),table.getType());
+
                     List<Mutation> additionalTableMetaData = Lists.newArrayList();
-                    
-                    PTableType type = table.getType();
-                    // TODO propagate to grandchild views as well
-                    if (type == PTableType.TABLE || type == PTableType.SYSTEM) {
-                        TableViewFinderResult childViewsResult = new TableViewFinderResult();
-                        findAllChildViews(region, tenantId, table.getSchemaName().getBytes(), table.getTableName().getBytes(), childViewsResult);
-                        if (childViewsResult.hasViews()) {
-                            MetaDataMutationResult mutationResult =
-                                    dropColumnsFromChildViews(region, table,
-                                        locks, tableMetaData, additionalTableMetaData,
-                                        schemaName, tableName, invalidateList,
-                                        clientTimeStamp, childViewsResult, tableNamesToDelete, sharedTablesToDelete);
-                            // return if we were not able to drop the column successfully
-                            if (mutationResult != null) return mutationResult;
-                        }
-                    }
-                    
-                    for (Mutation m : tableMetaData) {
-                        if (m instanceof Delete) {
-                            byte[] key = m.getRow();
-                            int pkCount = getVarChars(key, rowKeyMetaData);
+                    ListIterator<Mutation> iterator = tableMetaData.listIterator();
+                    while (iterator.hasNext()) {
+                        Mutation mutation = iterator.next();
+                        byte[] key = mutation.getRow();
+                        int pkCount = getVarChars(key, rowKeyMetaData);
+                        if (isView && mutation instanceof Put) {
+                        	PColumn column = getColumn(pkCount, rowKeyMetaData, table);
+							if (column == null)
+								continue;
+                        	// ignore any puts that modify the ordinal positions of columns
+                        	iterator.remove();
+                        } 
+                        else if (mutation instanceof Delete) {
                             if (pkCount > COLUMN_NAME_INDEX
-                                    && Bytes.compareTo(schemaName,
-                                        rowKeyMetaData[SCHEMA_NAME_INDEX]) == 0
-                                    && Bytes.compareTo(tableName, rowKeyMetaData[TABLE_NAME_INDEX]) == 0) {
+                                && Bytes.compareTo(schemaName, rowKeyMetaData[SCHEMA_NAME_INDEX]) == 0
+                                && Bytes.compareTo(tableName, rowKeyMetaData[TABLE_NAME_INDEX]) == 0) {
                                 PColumn columnToDelete = null;
                                 try {
-                                    if (pkCount > FAMILY_NAME_INDEX
-                                            && rowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX].length > 0) {
-                                        PColumnFamily family =
-                                                table.getColumnFamily(rowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]);
-                                        columnToDelete =
-                                                family.getPColumnForColumnNameBytes(rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX]);
-                                    } else if (pkCount > COLUMN_NAME_INDEX
-                                            && rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX].length > 0) {
-                                        deletePKColumn = true;
-                                        columnToDelete = table.getPKColumn(new String(
-                                          rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX]));
-                                    } else {
-                                        continue;
-                                    }
-                                    if (table.getType() == PTableType.VIEW) {
+                                	columnToDelete = getColumn(pkCount, rowKeyMetaData, table);
+									if (columnToDelete == null)
+										continue;
+                                    deletePKColumn = columnToDelete.getFamilyName() == null;
+									if (isView) {
+                                        // if we are dropping a derived column add it to the excluded column list
+                                        if (columnToDelete.isDerived()) {
+                                            mutation = MetaDataUtil
+                                                .cloneDeleteToPutAndAddColumn((Delete) mutation, TABLE_FAMILY_BYTES, LINK_TYPE_BYTES, LinkType.EXCLUDED_COLUMN.getSerializedValueAsByteArray());
+                                            iterator.set(mutation);
+                                        }
+
                                         if (table.getBaseColumnCount() != DIVERGED_VIEW_BASE_COLUMN_COUNT
-                                                && columnToDelete.getPosition() < table.getBaseColumnCount()) {
+                                            && columnToDelete.isDerived()) {
                                             /*
                                              * If the column being dropped is inherited from the base table, then the
                                              * view is about to diverge itself from the base table. The consequence of
@@ -3209,10 +3413,10 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                                             Put updateBaseColumnCountPut = new Put(viewKey);
                                             byte[] baseColumnCountPtr = new byte[PInteger.INSTANCE.getByteSize()];
                                             PInteger.INSTANCE.getCodec().encodeInt(DIVERGED_VIEW_BASE_COLUMN_COUNT,
-                                                    baseColumnCountPtr, 0);
+                                                baseColumnCountPtr, 0);
                                             updateBaseColumnCountPut.addColumn(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
-                                                    PhoenixDatabaseMetaData.BASE_COLUMN_COUNT_BYTES, clientTimeStamp,
-                                                    baseColumnCountPtr);
+                                                PhoenixDatabaseMetaData.BASE_COLUMN_COUNT_BYTES, clientTimeStamp,
+                                                baseColumnCountPtr);
                                             additionalTableMetaData.add(updateBaseColumnCountPut);
                                         }
                                     }
@@ -3223,18 +3427,19 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                                     dropIndexes(table, region, invalidateList, locks,
                                         clientTimeStamp, schemaName, tableName,
                                         additionalTableMetaData, columnToDelete,
-                                        tableNamesToDelete, sharedTablesToDelete);
+                                        tableNamesToDelete, sharedTablesToDelete, request.getClientVersion());
                                 } catch (ColumnFamilyNotFoundException e) {
                                     return new MetaDataMutationResult(
-                                            MutationCode.COLUMN_NOT_FOUND, EnvironmentEdgeManager
-                                                    .currentTimeMillis(), table, columnToDelete);
+                                        MutationCode.COLUMN_NOT_FOUND, EnvironmentEdgeManager
+                                        .currentTimeMillis(), table, columnToDelete);
                                 } catch (ColumnNotFoundException e) {
                                     return new MetaDataMutationResult(
-                                            MutationCode.COLUMN_NOT_FOUND, EnvironmentEdgeManager
-                                                    .currentTimeMillis(), table, columnToDelete);
-                                } 
+                                        MutationCode.COLUMN_NOT_FOUND, EnvironmentEdgeManager
+                                        .currentTimeMillis(), table, columnToDelete);
+                                }
                             }
                         }
+
                     }
                     if (deletePKColumn) {
                         if (table.getPKColumns().size() == 1) {
@@ -3246,19 +3451,21 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     long currentTime = MetaDataUtil.getClientTimeStamp(tableMetaData);
                     return new MetaDataMutationResult(MutationCode.TABLE_ALREADY_EXISTS, currentTime, null, tableNamesToDelete, sharedTablesToDelete);
                 }
-            });
+            }, request.getClientVersion());
             if (result != null) {
                 done.run(MetaDataMutationResult.toProto(result));
             }
-        } catch (IOException ioe) {
-            ProtobufUtil.setControllerException(controller, ioe);
+        } catch (Throwable e) {
+            logger.error("Drop column failed: ", e);
+            ProtobufUtil.setControllerException(controller,
+                ServerUtil.createIOException("Error when dropping column: ", e));
         }
     }
-    
+
     private void dropIndexes(PTable table, Region region, List<ImmutableBytesPtr> invalidateList,
             List<RowLock> locks, long clientTimeStamp, byte[] schemaName,
             byte[] tableName, List<Mutation> additionalTableMetaData, PColumn columnToDelete, 
-            List<byte[]> tableNamesToDelete, List<SharedTableState> sharedTablesToDelete)
+            List<byte[]> tableNamesToDelete, List<SharedTableState> sharedTablesToDelete, int clientVersion)
             throws IOException, SQLException {
         // Look for columnToDelete in any indexes. If found as PK column, get lock and drop the
         // index and then invalidate it
@@ -3270,7 +3477,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         } catch (ClassNotFoundException e) {
         }
         for (PTable index : table.getIndexes()) {
-            byte[] tenantId = index.getTenantId() == null ? ByteUtil.EMPTY_BYTE_ARRAY : index.getTenantId().getBytes(); 
+            byte[] tenantId = index.getTenantId() == null ? ByteUtil.EMPTY_BYTE_ARRAY : index.getTenantId().getBytes();
             IndexMaintainer indexMaintainer = index.getIndexMaintainer(table, connection);
             byte[] indexKey =
                     SchemaUtil.getTableKey(tenantId, index.getSchemaName().getBytes(), index
@@ -3295,9 +3502,12 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 // Drop the link between the data table and the
                 // index table
                 additionalTableMetaData.add(new Delete(linkKey, clientTimeStamp));
+                List<Mutation> childLinksMutations = Lists.newArrayList();
                 doDropTable(indexKey, tenantId, index.getSchemaName().getBytes(), index
                         .getTableName().getBytes(), tableName, index.getType(),
-                    additionalTableMetaData, invalidateList, locks, tableNamesToDelete, sharedTablesToDelete, false);
+                    additionalTableMetaData, childLinksMutations, invalidateList, tableNamesToDelete, sharedTablesToDelete, false, clientVersion);
+                // there should be no child links to delete since we are just dropping an index
+                assert(childLinksMutations.isEmpty());
                 invalidateList.add(new ImmutableBytesPtr(indexKey));
             }
             // If the dropped column is a covered index column, invalidate the index
@@ -3325,15 +3535,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
 
         GetVersionResponse.Builder builder = GetVersionResponse.newBuilder();
         Configuration config = env.getConfiguration();
-        boolean isTablesMappingEnabled = SchemaUtil.isNamespaceMappingEnabled(PTableType.TABLE,
-                new ReadOnlyProps(config.iterator()));
         if (isTablesMappingEnabled
                 && PhoenixDatabaseMetaData.MIN_NAMESPACE_MAPPED_PHOENIX_VERSION > request.getClientVersion()) {
             logger.error("Old client is not compatible when" + " system tables are upgraded to map to namespace");
             ProtobufUtil.setControllerException(controller,
                     ServerUtil.createIOException(
-                            SchemaUtil.getPhysicalHBaseTableName(PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME,
-                                    isTablesMappingEnabled, PTableType.SYSTEM).getString(),
+                            SchemaUtil.getPhysicalTableName(PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES,
+                                    isTablesMappingEnabled).toString(),
                     new DoNotRetryIOException(
                             "Old client is not compatible when" + " system tables are upgraded to map to namespace")));
         }
@@ -3363,33 +3571,33 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 done.run(MetaDataMutationResult.toProto(result));
                 return;
             }
-            long timeStamp = MetaDataUtil.getClientTimeStamp(tableMetadata);
+            long timeStamp = HConstants.LATEST_TIMESTAMP;
             ImmutableBytesPtr cacheKey = new ImmutableBytesPtr(key);
             List<Cell> newKVs = tableMetadata.get(0).getFamilyCellMap().get(TABLE_FAMILY_BYTES);
             Cell newKV = null;
             int disableTimeStampKVIndex = -1;
             int indexStateKVIndex = 0;
             int index = 0;
-            for(Cell cell : newKVs){
+            for(Cell cell : newKVs) {
                 if(Bytes.compareTo(cell.getQualifierArray(), cell.getQualifierOffset(), cell.getQualifierLength(),
                       INDEX_STATE_BYTES, 0, INDEX_STATE_BYTES.length) == 0){
                   newKV = cell;
                   indexStateKVIndex = index;
+                  timeStamp = cell.getTimestamp();
                 } else if (Bytes.compareTo(cell.getQualifierArray(), cell.getQualifierOffset(), cell.getQualifierLength(),
-                  INDEX_DISABLE_TIMESTAMP_BYTES, 0, INDEX_DISABLE_TIMESTAMP_BYTES.length) == 0){
+                  INDEX_DISABLE_TIMESTAMP_BYTES, 0, INDEX_DISABLE_TIMESTAMP_BYTES.length) == 0) {
                   disableTimeStampKVIndex = index;
                 }
                 index++;
             }
             PIndexState newState =
                     PIndexState.fromSerializedValue(newKV.getValueArray()[newKV.getValueOffset()]);
-            RowLock rowLock = region.getRowLock(key, false);
+            RowLock rowLock = acquireLock(region, key, null);
             if (rowLock == null) {
                 throw new IOException("Failed to acquire lock on " + Bytes.toStringBinary(key));
             }
             try {
                 Get get = new Get(key);
-                get.setTimeRange(PTable.INITIAL_SEQ_NUM, timeStamp);
                 get.addColumn(TABLE_FAMILY_BYTES, DATA_TABLE_NAME_BYTES);
                 get.addColumn(TABLE_FAMILY_BYTES, INDEX_STATE_BYTES);
                 get.addColumn(TABLE_FAMILY_BYTES, INDEX_DISABLE_TIMESTAMP_BYTES);
@@ -3406,22 +3614,59 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 Cell currentDisableTimeStamp = currentResult.getColumnLatestCell(TABLE_FAMILY_BYTES, INDEX_DISABLE_TIMESTAMP_BYTES);
                 boolean rowKeyOrderOptimizable = currentResult.getColumnLatestCell(TABLE_FAMILY_BYTES, ROW_KEY_ORDER_OPTIMIZABLE_BYTES) != null;
 
+                //check permission on data table
+                long clientTimeStamp = MetaDataUtil.getClientTimeStamp(tableMetadata);
+                PTable loadedTable = loadTable(env, key, new ImmutableBytesPtr(key), clientTimeStamp, clientTimeStamp,
+                        request.getClientVersion());
+                if (loadedTable == null) {
+                    builder.setReturnCode(MetaDataProtos.MutationCode.TABLE_NOT_FOUND);
+                    builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
+                    done.run(builder.build());
+                    return;
+                }
+                getCoprocessorHost().preIndexUpdate(Bytes.toString(tenantId),
+                        SchemaUtil.getTableName(schemaName, tableName),
+                        TableName.valueOf(loadedTable.getPhysicalName().getBytes()),
+                        getParentPhysicalTableName(loadedTable),
+                        newState);
+
                 PIndexState currentState =
                         PIndexState.fromSerializedValue(currentStateKV.getValueArray()[currentStateKV
                                 .getValueOffset()]);
-
-                if ((currentDisableTimeStamp != null && currentDisableTimeStamp.getValueLength() > 0) &&
-                        (disableTimeStampKVIndex >= 0)) {
-                    long curTimeStampVal = (Long) PLong.INSTANCE.toObject(currentDisableTimeStamp.getValueArray(),
+                // Timestamp of INDEX_STATE gets updated with each call
+                long actualTimestamp = currentStateKV.getTimestamp();
+                long curTimeStampVal = 0;
+                if ((currentDisableTimeStamp != null && currentDisableTimeStamp.getValueLength() > 0)) {
+                    curTimeStampVal = (Long) PLong.INSTANCE.toObject(currentDisableTimeStamp.getValueArray(),
                             currentDisableTimeStamp.getValueOffset(), currentDisableTimeStamp.getValueLength());
                     // new DisableTimeStamp is passed in
-                    Cell newDisableTimeStampCell = newKVs.get(disableTimeStampKVIndex);
-                    long newDisableTimeStamp = (Long) PLong.INSTANCE.toObject(newDisableTimeStampCell.getValueArray(),
-                            newDisableTimeStampCell.getValueOffset(), newDisableTimeStampCell.getValueLength());
-                    if(curTimeStampVal > 0 && curTimeStampVal < newDisableTimeStamp){
-                        // not reset disable timestamp
-                        newKVs.remove(disableTimeStampKVIndex);
-                        disableTimeStampKVIndex = -1;
+                    if (disableTimeStampKVIndex >= 0) {
+                        Cell newDisableTimeStampCell = newKVs.get(disableTimeStampKVIndex);
+                        long expectedTimestamp = newDisableTimeStampCell.getTimestamp();
+                        // If the index status has been updated after the upper bound of the scan we use
+                        // to partially rebuild the index, then we need to fail the rebuild because an
+                        // index write failed before the rebuild was complete.
+                        if (actualTimestamp > expectedTimestamp) {
+                            builder.setReturnCode(MetaDataProtos.MutationCode.UNALLOWED_TABLE_MUTATION);
+                            builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
+                            done.run(builder.build());
+                            return;
+                        }
+                        long newDisableTimeStamp = (Long) PLong.INSTANCE.toObject(newDisableTimeStampCell.getValueArray(),
+                                newDisableTimeStampCell.getValueOffset(), newDisableTimeStampCell.getValueLength());
+                        // We use the sign of the INDEX_DISABLE_TIMESTAMP to differentiate the keep-index-active (negative)
+                        // from block-writes-to-data-table case. In either case, we want to keep the oldest timestamp to
+                        // drive the partial index rebuild rather than update it with each attempt to update the index
+                        // when a new data table write occurs.
+                        // We do legitimately move the INDEX_DISABLE_TIMESTAMP to be newer when we're rebuilding the
+                        // index in which case the state will be INACTIVE or PENDING_ACTIVE.
+                        if (curTimeStampVal != 0 
+                                && (newState == PIndexState.DISABLE || newState == PIndexState.PENDING_ACTIVE) 
+                                && Math.abs(curTimeStampVal) < Math.abs(newDisableTimeStamp)) {
+                            // do not reset disable timestamp as we want to keep the min
+                            newKVs.remove(disableTimeStampKVIndex);
+                            disableTimeStampKVIndex = -1;
+                        }
                     }
                 }
                 // Detect invalid transitions
@@ -3433,8 +3678,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                         return;
                     }
                 } else if (currentState == PIndexState.DISABLE) {
+                    // Can't transition back to INACTIVE if INDEX_DISABLE_TIMESTAMP is 0
                     if (newState != PIndexState.BUILDING && newState != PIndexState.DISABLE &&
-                        newState != PIndexState.INACTIVE) {
+                        (newState != PIndexState.INACTIVE || curTimeStampVal == 0)) {
                         builder.setReturnCode(MetaDataProtos.MutationCode.UNALLOWED_TABLE_MUTATION);
                         builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
                         done.run(builder.build());
@@ -3449,29 +3695,42 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 if (currentState == PIndexState.BUILDING && newState != PIndexState.ACTIVE) {
                     timeStamp = currentStateKV.getTimestamp();
                 }
-                if ((currentState == PIndexState.UNUSABLE && newState == PIndexState.ACTIVE)
-                        || (currentState == PIndexState.ACTIVE && newState == PIndexState.UNUSABLE)) {
+                if ((currentState == PIndexState.ACTIVE || currentState == PIndexState.PENDING_ACTIVE) && newState == PIndexState.UNUSABLE) {
                     newState = PIndexState.INACTIVE;
                     newKVs.set(indexStateKVIndex, KeyValueUtil.newKeyValue(key, TABLE_FAMILY_BYTES,
                         INDEX_STATE_BYTES, timeStamp, Bytes.toBytes(newState.getSerializedValue())));
-                } else if (currentState == PIndexState.INACTIVE && newState == PIndexState.USABLE) {
-                    newState = PIndexState.ACTIVE;
+                } else if ((currentState == PIndexState.INACTIVE || currentState == PIndexState.PENDING_ACTIVE) && newState == PIndexState.USABLE) {
+                    // Don't allow manual state change to USABLE (i.e. ACTIVE) if non zero INDEX_DISABLE_TIMESTAMP
+                    if (curTimeStampVal != 0) {
+                        newState = currentState;
+                    } else {
+                        newState = PIndexState.ACTIVE;
+                    }
                     newKVs.set(indexStateKVIndex, KeyValueUtil.newKeyValue(key, TABLE_FAMILY_BYTES,
                         INDEX_STATE_BYTES, timeStamp, Bytes.toBytes(newState.getSerializedValue())));
                 }
 
                 PTable returnTable = null;
                 if (currentState != newState || disableTimeStampKVIndex != -1) {
+                    // make a copy of tableMetadata so we can add to it
+                    tableMetadata = new ArrayList<Mutation>(tableMetadata);
+                    // Always include the empty column value at latest timestamp so
+                    // that clients pull over update.
+                    Put emptyValue = new Put(key);
+                    emptyValue.addColumn(TABLE_FAMILY_BYTES, 
+                            QueryConstants.EMPTY_COLUMN_BYTES, 
+                            HConstants.LATEST_TIMESTAMP, 
+                            QueryConstants.EMPTY_COLUMN_VALUE_BYTES);
+                    tableMetadata.add(emptyValue);
                     byte[] dataTableKey = null;
-                    if(dataTableKV != null) {
-                        dataTableKey = SchemaUtil.getTableKey(tenantId, schemaName, dataTableKV.getValue());
-                    }
-                    if(dataTableKey != null) {
-                        // make a copy of tableMetadata
-                        tableMetadata = new ArrayList<Mutation>(tableMetadata);
+                    if (dataTableKV != null) {
+                        dataTableKey = SchemaUtil.getTableKey(tenantId, schemaName, CellUtil.cloneValue(dataTableKV));
                         // insert an empty KV to trigger time stamp update on data table row
                         Put p = new Put(dataTableKey);
-                        p.add(TABLE_FAMILY_BYTES, QueryConstants.EMPTY_COLUMN_BYTES, timeStamp, QueryConstants.EMPTY_COLUMN_VALUE_BYTES);
+                        p.addColumn(TABLE_FAMILY_BYTES,
+                                QueryConstants.EMPTY_COLUMN_BYTES,
+                                HConstants.LATEST_TIMESTAMP,
+                                QueryConstants.EMPTY_COLUMN_VALUE_BYTES);
                         tableMetadata.add(p);
                     }
                     boolean setRowKeyOrderOptimizableCell = newState == PIndexState.BUILDING && !rowKeyOrderOptimizable;
@@ -3480,7 +3739,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     if (setRowKeyOrderOptimizableCell) {
                         UpgradeUtil.addRowKeyOrderOptimizableCell(tableMetadata, key, timeStamp);
                     }
-                    region.mutateRowsWithLocks(tableMetadata, Collections.<byte[]> emptySet(), HConstants.NO_NONCE,
+                    mutateRowsWithLocks(region, tableMetadata, Collections.<byte[]> emptySet(), HConstants.NO_NONCE,
                         HConstants.NO_NONCE);
                     // Invalidate from cache
                     Cache<ImmutableBytesPtr,PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
@@ -3490,7 +3749,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     }
                     if (setRowKeyOrderOptimizableCell || disableTimeStampKVIndex != -1
                             || currentState == PIndexState.DISABLE || newState == PIndexState.BUILDING) {
-                        returnTable = doGetTable(key, HConstants.LATEST_TIMESTAMP, rowLock);
+                        returnTable = doGetTable(key, HConstants.LATEST_TIMESTAMP, rowLock, request.getClientVersion());
                     }
                 }
                 // Get client timeStamp from mutations, since it may get updated by the
@@ -3514,14 +3773,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     }
 
     private static MetaDataMutationResult checkKeyInRegion(byte[] key, Region region, MutationCode code) {
-        byte[] startKey = region.getRegionInfo().getStartKey();
-        byte[] endKey = region.getRegionInfo().getEndKey();
-        if (Bytes.compareTo(startKey, key) <= 0
-                && (Bytes.compareTo(HConstants.LAST_ROW, endKey) == 0 || Bytes.compareTo(key,
-                    endKey) < 0)) {
-            return null; // normal case;
-        }
-        return new MetaDataMutationResult(code, EnvironmentEdgeManager.currentTimeMillis(), null);
+        return ServerUtil.isKeyInRegion(key, region) ? null : 
+            new MetaDataMutationResult(code, EnvironmentEdgeManager.currentTimeMillis(), null);
     }
 
     private static MetaDataMutationResult checkTableKeyInRegion(byte[] key, Region region) {
@@ -3537,48 +3790,29 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         return checkKeyInRegion(key, region, MutationCode.SCHEMA_NOT_IN_REGION);
 
     }
-
-    /**
-     * Certain operations, such as DROP TABLE are not allowed if there a table has child views. This class wraps the
-     * Results of a scanning the Phoenix Metadata for child views for a specific table and stores an additional flag for
-     * whether whether SYSTEM.CATALOG has split across multiple regions.
-     */
-    private static class TableViewFinderResult {
-
-        private List<Result> results = Lists.newArrayList();
-        private boolean allViewsNotInSingleRegion = false;
-
-        private TableViewFinderResult() {
-        }
+    
+    private static class ViewInfo {
+        private byte[] tenantId;
+        private byte[] schemaName;
+        private byte[] viewName;
         
-        private TableViewFinderResult(List<Result> results) {
-            this.results = results;
-        }
-        
-        public boolean hasViews() {
-            return !results.isEmpty();
-        }
-
-        private void setAllViewsNotInSingleRegion() {
-            allViewsNotInSingleRegion = true;
+        public ViewInfo(byte[] tenantId, byte[] schemaName, byte[] viewName) {
+            super();
+            this.tenantId = tenantId;
+            this.schemaName = schemaName;
+            this.viewName = viewName;
         }
 
-        private List<Result> getResults() {
-            return results;
+        public byte[] getTenantId() {
+            return tenantId;
         }
 
-        /**
-         * Returns true is the table has views and they are all in the same HBase region.
-         */
-        private boolean allViewsInSingleRegion() {
-            return results.size() > 0 && !allViewsNotInSingleRegion;
+        public byte[] getSchemaName() {
+            return schemaName;
         }
 
-        /**
-         * Returns true is the table has views and they are all NOT in the same HBase region.
-         */
-        private boolean allViewsInMultipleRegions() {
-            return results.size() > 0 && allViewsNotInSingleRegion;
+        public byte[] getViewName() {
+            return viewName;
         }
         
         private void addResult(TableViewFinderResult result) {
@@ -3602,7 +3836,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     GlobalCache.getInstance(this.env).getMetaDataCache();
             metaDataCache.invalidate(cacheKey);
         } catch (Throwable t) {
-            logger.error("incrementTableTimeStamp failed", t);
+            logger.error("clearTableFromCache failed", t);
             ProtobufUtil.setControllerException(controller,
                 ServerUtil.createIOException(SchemaUtil.getTableName(schemaName, tableName), t));
         }
@@ -3622,6 +3856,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         long clientTimeStamp = request.getClientTimestamp();
         List<RowLock> locks = Lists.newArrayList();
         try {
+            getCoprocessorHost().preGetSchema(schemaName);
             acquireLock(region, lockKey, locks);
             // Get as of latest timestamp so we can detect if we have a
             // newer schema that already
@@ -3652,7 +3887,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             done.run(builder.build());
             return;
         } finally {
-            region.releaseRowLocks(locks);
+            releaseRowLocks(region,locks);
         }
     }
 
@@ -3755,7 +3990,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 }
                 // Don't store function info for temporary functions.
                 if(!temporaryFunction) {
-                    region.mutateRowsWithLocks(functionMetaData, Collections.<byte[]> emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
+                    mutateRowsWithLocks(region, functionMetaData, Collections.<byte[]> emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
                 }
 
                 // Invalidate the cache - the next getFunction call will add it
@@ -3769,13 +4004,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 done.run(builder.build());
                 return;
             } finally {
-                region.releaseRowLocks(locks);
+                releaseRowLocks(region,locks);
             }
         } catch (Throwable t) {
           logger.error("createFunction failed", t);
             ProtobufUtil.setControllerException(controller,
                 ServerUtil.createIOException(Bytes.toString(functionName), t));
-        }         
+        }
     }
 
     @Override
@@ -3808,26 +4043,26 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     done.run(MetaDataMutationResult.toProto(result));
                     return;
                 }
-                region.mutateRowsWithLocks(functionMetaData, Collections.<byte[]> emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
+                mutateRowsWithLocks(region, functionMetaData, Collections.<byte[]> emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
 
                 Cache<ImmutableBytesPtr,PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
                 long currentTime = MetaDataUtil.getClientTimeStamp(functionMetaData);
                 for(ImmutableBytesPtr ptr: invalidateList) {
                     metaDataCache.invalidate(ptr);
                     metaDataCache.put(ptr, newDeletedFunctionMarker(currentTime));
-                    
+
                 }
 
                 done.run(MetaDataMutationResult.toProto(result));
                 return;
             } finally {
-                region.releaseRowLocks(locks);
+                releaseRowLocks(region,locks);
             }
         } catch (Throwable t) {
           logger.error("dropFunction failed", t);
             ProtobufUtil.setControllerException(controller,
                 ServerUtil.createIOException(Bytes.toString(functionName), t));
-        }         
+        }
     }
 
     private MetaDataMutationResult doDropFunction(long clientTimeStamp, List<byte[]> keys, List<Mutation> functionMetaData, List<ImmutableBytesPtr> invalidateList)
@@ -3918,7 +4153,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                         return;
                     }
                 }
-                region.mutateRowsWithLocks(schemaMutations, Collections.<byte[]> emptySet(), HConstants.NO_NONCE,
+                mutateRowsWithLocks(region, schemaMutations, Collections.<byte[]> emptySet(), HConstants.NO_NONCE,
                         HConstants.NO_NONCE);
 
                 // Invalidate the cache - the next getSchema call will add it
@@ -3936,7 +4171,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 done.run(builder.build());
                 return;
             } finally {
-                region.releaseRowLocks(locks);
+                releaseRowLocks(region,locks);
             }
         } catch (Throwable t) {
             logger.error("Creating the schema" + schemaName + "failed", t);
@@ -3950,6 +4185,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         try {
             List<Mutation> schemaMetaData = ProtobufUtil.getMutations(request);
             schemaName = request.getSchemaName();
+            getCoprocessorHost().preDropSchema(schemaName);
             byte[] lockKey = SchemaUtil.getSchemaKey(schemaName);
             Region region = env.getRegion();
             MetaDataMutationResult result = checkSchemaKeyInRegion(lockKey, region);
@@ -3967,7 +4203,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     done.run(MetaDataMutationResult.toProto(result));
                     return;
                 }
-                region.mutateRowsWithLocks(schemaMetaData, Collections.<byte[]> emptySet(), HConstants.NO_NONCE,
+                mutateRowsWithLocks(region, schemaMetaData, Collections.<byte[]> emptySet(), HConstants.NO_NONCE,
                         HConstants.NO_NONCE);
                 Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env)
                         .getMetaDataCache();
@@ -3979,7 +4215,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 done.run(MetaDataMutationResult.toProto(result));
                 return;
             } finally {
-                region.releaseRowLocks(locks);
+                releaseRowLocks(region,locks);
             }
         } catch (Throwable t) {
             logger.error("drop schema failed:", t);
@@ -4024,5 +4260,49 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         return new MetaDataMutationResult(MutationCode.SCHEMA_NOT_FOUND, EnvironmentEdgeManager.currentTimeMillis(),
                 null);
 
+    }
+    
+    private void mutateRowsWithLocks(final Region region, final List<Mutation> mutations, final Set<byte[]> rowsToLock,
+            final long nonceGroup, final long nonce) throws IOException {
+        // we need to mutate SYSTEM.CATALOG with HBase/login user if access is enabled.
+        if (this.accessCheckEnabled) {
+            User.runAsLoginUser(new PrivilegedExceptionAction<Void>() {
+                @Override
+                public Void run() throws Exception {
+                    final Call rpcContext = RpcUtil.getRpcContext();
+                    // Setting RPC context as null so that user can be resetted
+                    try {
+                        RpcUtil.setRpcContext(null);
+                        region.mutateRowsWithLocks(mutations, rowsToLock, nonceGroup, nonce);
+                    } catch (Throwable e) {
+                        throw new IOException(e);
+                    } finally {
+                        // Setting RPC context back to original context of the RPC
+                        RpcUtil.setRpcContext(rpcContext);
+                    }
+                    return null;
+                }
+            });
+        } else {
+            region.mutateRowsWithLocks(mutations, rowsToLock, nonceGroup, nonce);
+        }
+    }
+    
+    private TableName getParentPhysicalTableName(PTable table) {
+        return table
+                .getType() == PTableType.VIEW
+                        ? TableName.valueOf(table.getPhysicalName().getBytes())
+                        : table.getType() == PTableType.INDEX
+                                ? TableName
+                                        .valueOf(SchemaUtil
+                                                .getPhysicalHBaseTableName(table.getParentSchemaName(),
+                                                        table.getParentTableName(), table.isNamespaceMapped())
+                                                .getBytes())
+                                : TableName
+                                        .valueOf(
+                                                SchemaUtil
+                                                        .getPhysicalHBaseTableName(table.getSchemaName(),
+                                                                table.getTableName(), table.isNamespaceMapped())
+                                                        .getBytes());
     }
 }

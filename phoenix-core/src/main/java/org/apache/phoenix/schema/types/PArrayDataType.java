@@ -20,6 +20,8 @@ package org.apache.phoenix.schema.types;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.sql.Array;
+import java.sql.SQLException;
 import java.sql.Types;
 import java.text.Format;
 import java.util.regex.Pattern;
@@ -73,7 +75,12 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
     // array serialization format where bytes can be used as part of the row key
     public static final byte SORTABLE_SERIALIZATION_VERSION = 1;
     // array serialization format where bytes are immutable (does not support prepend/append or sorting)
+    @Deprecated
     public static final byte IMMUTABLE_SERIALIZATION_VERSION = 2;
+    // array serialization format where bytes are immutable (does not support prepend/append or sorting)
+    // differs from V1 in that nulls are not serialized
+    // we rely only on offsets to determine the presence of nulls
+    public static final byte IMMUTABLE_SERIALIZATION_V2 = 3;
     
     protected PArrayDataType(String sqlTypeName, int sqlType, Class clazz, PDataCodec codec, int ordinal) {
         super(sqlTypeName, sqlType, clazz, codec, ordinal);
@@ -86,10 +93,34 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
     public byte[] toBytes(Object object, PDataType baseType, SortOrder sortOrder) {
         return toBytes(object, baseType, sortOrder, true);
     }
+
+    /**
+     * Ensures that the provided {@code object} is a PhoenixArray, attempting a conversion in the
+     * case when it is not.
+     */
+    PhoenixArray toPhoenixArray(Object object, PDataType baseType) {
+        if (object instanceof PhoenixArray) {
+            return (PhoenixArray) object;
+        }
+        if (!(object instanceof Array)) {
+            throw new IllegalArgumentException("Expected an Array but got " + object.getClass());
+        }
+        Array arr = (Array) object;
+        try {
+            Object untypedArrayData = arr.getArray();
+            if (!(untypedArrayData instanceof Object[])) {
+                throw new IllegalArgumentException("Array data is required to be Object[] but data for "
+                    + arr.getClass() + " is " + untypedArrayData.getClass());
+            }
+            return this.getArrayFactory().newArray(baseType, (Object[]) untypedArrayData);
+        } catch (SQLException e) {
+            throw new IllegalArgumentException("Could not convert Array data", e);
+        }
+    }
     
     public byte[] toBytes(Object object, PDataType baseType, SortOrder sortOrder, boolean rowKeyOrderOptimizable) {
         if (object == null) { throw new ConstraintViolationException(this + " may not be null"); }
-        PhoenixArray arr = ((PhoenixArray)object);
+        PhoenixArray arr = toPhoenixArray(object, baseType);
         int noOfElements = arr.numElements;
         if (noOfElements == 0) { return ByteUtil.EMPTY_BYTE_ARRAY; }
         TrustedByteArrayOutputStream byteStream = null;
@@ -115,7 +146,7 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
         }
         DataOutputStream oStream = new DataOutputStream(byteStream);
         // Handles bit inversion also
-        return createArrayBytes(byteStream, oStream, (PhoenixArray)object, noOfElements, baseType, sortOrder, rowKeyOrderOptimizable);
+        return createArrayBytes(byteStream, oStream, arr, noOfElements, baseType, sortOrder, rowKeyOrderOptimizable);
     }
 
     public static int serializeNulls(DataOutputStream oStream, int nulls) throws IOException {
@@ -191,7 +222,7 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
     }
     
     public static boolean useShortForOffsetArray(int maxoffset, byte serializationVersion) {
-    	if (serializationVersion == IMMUTABLE_SERIALIZATION_VERSION) {
+    if (serializationVersion == IMMUTABLE_SERIALIZATION_VERSION || serializationVersion == IMMUTABLE_SERIALIZATION_V2) {
     		 return (maxoffset <= Short.MAX_VALUE && maxoffset >= Short.MIN_VALUE );
     	}
     	// If the max offset is less than Short.MAX_VALUE then offset array can use short
@@ -357,7 +388,10 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
 		int offset;
         if (useShort) {
             offset = indexOffset + (Bytes.SIZEOF_SHORT * arrayIndex);
-            return Bytes.toShort(bytes, offset, Bytes.SIZEOF_SHORT) + (serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_VERSION ? 0 : Short.MAX_VALUE);
+            return Bytes.toShort(bytes, offset, Bytes.SIZEOF_SHORT)
+                    + (serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_VERSION
+                            || serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_V2 ? 0
+                                    : Short.MAX_VALUE);
         } else {
             offset = indexOffset + (Bytes.SIZEOF_INT * arrayIndex);
             return Bytes.toInt(bytes, offset, Bytes.SIZEOF_INT);
@@ -376,7 +410,7 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
 
     @Override
     public Object toObject(Object object, PDataType actualType) {
-        return object;
+        return toPhoenixArray(object, arrayBaseType(actualType));
     }
 
     public Object toObject(Object object, PDataType actualType, SortOrder sortOrder) {
@@ -399,11 +433,39 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
         return builder.encode();
     }
 
+    private static byte[] generateEmptyArrayBytes(PDataType baseType, SortOrder sortOrder) {
+        PArrayDataTypeEncoder encoder = new PArrayDataTypeEncoder(baseType, sortOrder);
+        byte[] arrayBytes = encoder.encode();
+        if (arrayBytes == null) {
+            arrayBytes = ByteUtil.EMPTY_BYTE_ARRAY;
+        }
+        return arrayBytes;
+    }
+    
+    /**
+     * Appends an item to array. Uses the ptr bytes of item and the array bytes to create new array bytes with appended item bytes,
+     * then sets the new array bytes to ptr.
+     *
+     * @param ptr holds the bytes of the item to be added to array
+     * @param arrayBytes byte [] form of phoenix array
+     * @param length arrayBytes length
+     * @param offset arrayBytes offset
+     * @param arrayLength length of the array
+     * @param maxLength maximum length of the item to be added
+     * @param sortOrder sort order of the elements in array
+     */
     public static boolean appendItemToArray(ImmutableBytesWritable ptr, int length, int offset, byte[] arrayBytes,
             PDataType baseType, int arrayLength, Integer maxLength, SortOrder sortOrder) {
         if (ptr.getLength() == 0) {
             ptr.set(arrayBytes, offset, length);
             return true;
+        }
+
+        // If the arrayBytes is null or empty, generate an empty array which will get filled in below
+        if (arrayBytes.length == 0) {
+            arrayBytes = generateEmptyArrayBytes(baseType, sortOrder);
+            offset = 0;
+            length = arrayBytes.length;
         }
 
         int elementLength = maxLength == null ? ptr.getLength() : maxLength;
@@ -425,7 +487,7 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
                     - Bytes.SIZEOF_BYTE;
 
             // checks whether offset array consists of shorts or integers
-            boolean useInt = offsetArrayLength / Math.abs(arrayLength) == Bytes.SIZEOF_INT;
+            boolean useInt = arrayLength == 0 ? false : offsetArrayLength / Math.abs(arrayLength) == Bytes.SIZEOF_INT;
             boolean convertToInt = false;
 
             int newElementPosition = offsetArrayPosition - 2 * Bytes.SIZEOF_BYTE;
@@ -452,7 +514,11 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
             newArray[newOffsetArrayPosition-1] = sepByte;
             System.arraycopy(elementBytes, elementOffset, newArray, newElementPosition, elementLength);
 
-            arrayLength = (Math.abs(arrayLength) + 1) * (int)Math.signum(arrayLength);
+            int factor = (int)Math.signum(arrayLength);
+            if (factor == 0) {
+                factor = 1;
+            }
+            arrayLength = (Math.abs(arrayLength) + 1) * factor;
             if (useInt) {
                 System.arraycopy(arrayBytes, offset + offsetArrayPosition, newArray, newOffsetArrayPosition,
                         offsetArrayLength);
@@ -511,6 +577,13 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
         if (ptr.getLength() == 0) {
             elementLength = 0;
         }
+        // If the arrayBytes is null or empty, generate an empty array which will get filled in below
+        if (arrayBytes.length == 0) {
+            arrayBytes = generateEmptyArrayBytes(baseType, sortOrder);
+            offset = 0;
+            length = arrayBytes.length;
+        }
+
         // padding
         if (elementLength > ptr.getLength()) {
             baseType.pad(ptr, elementLength, sortOrder);
@@ -528,7 +601,7 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
             arrayLength = Math.abs(arrayLength);
 
             // checks whether offset array consists of shorts or integers
-            boolean useInt = offsetArrayLength / arrayLength == Bytes.SIZEOF_INT;
+            boolean useInt = arrayLength == 0 ? false : offsetArrayLength / arrayLength == Bytes.SIZEOF_INT;
             boolean convertToInt = false;
             int endElementPosition = getOffset(arrayBytes, arrayLength - 1, !useInt, offsetArrayPosition + offset, serializationVersion)
                     + elementLength + Bytes.SIZEOF_BYTE;
@@ -899,7 +972,11 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
             }
         } else {
             for (int pos : offsetPos) {
-                short val = serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_VERSION ? (short)pos : (short)(pos - Short.MAX_VALUE);
+                short val =
+                        serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_VERSION
+                                || serializationVersion == PArrayDataType.IMMUTABLE_SERIALIZATION_V2
+                                        ? (short) pos
+                                        : (short) (pos - Short.MAX_VALUE);
 				Bytes.putShort(offsetArr, off, val);
                 off += Bytes.SIZEOF_SHORT;
             }
@@ -1033,6 +1110,15 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
 
     @Override
     public int compareTo(Object lhs, Object rhs) {
+        if (lhs == rhs) {
+            return 0;
+        }
+        if (lhs == null) {
+            return -1;
+        }
+        if (rhs == null) {
+            return 1;
+        }
         PhoenixArray lhsArr = (PhoenixArray)lhs;
         PhoenixArray rhsArr = (PhoenixArray)rhs;
         if (lhsArr.equals(rhsArr)) { return 0; }
@@ -1041,6 +1127,9 @@ public abstract class PArrayDataType<T> extends PDataType<T> {
 
     public static int getArrayLength(ImmutableBytesWritable ptr, PDataType baseType, Integer maxLength) {
         byte[] bytes = ptr.get();
+        if (ptr.getLength() == 0) {
+            return 0;
+        }
         if (baseType.isFixedWidth()) {
             int elemLength = maxLength == null ? baseType.getByteSize() : maxLength;
             return (ptr.getLength() / elemLength);

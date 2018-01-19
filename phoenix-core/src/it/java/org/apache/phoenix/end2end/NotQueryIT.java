@@ -35,37 +35,28 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.util.Collection;
 import java.util.Properties;
 
-import org.apache.phoenix.util.PhoenixRuntime;
 import org.apache.phoenix.util.PropertiesUtil;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
 
 import com.google.common.primitives.Doubles;
 import com.google.common.primitives.Floats;
 
 
 @RunWith(Parameterized.class)
-public class NotQueryIT extends BaseQueryIT {
+public abstract class NotQueryIT extends BaseQueryIT {
 
-    public NotQueryIT(String indexDDL, boolean mutable, boolean columnEncoded) {
-        super(indexDDL, mutable, columnEncoded);
-    }
-    
-    @Parameters(name="NotQueryIT_{index}") // name is used by failsafe as file name in reports
-    public static Collection<Object> data() {
-        return QueryIT.data();
+    protected NotQueryIT(String indexDDL, boolean columnEncoded) throws Exception {
+        super(indexDDL, columnEncoded, false);
     }
     
     @Test
     public void testNotInList() throws Exception {
         String query = "SELECT entity_id FROM " + tableName + " WHERE organization_id=? and entity_id NOT IN (?,?,?,?,?,?)";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -93,7 +84,6 @@ public class NotQueryIT extends BaseQueryIT {
     public void testNotInListOfFloat() throws Exception {
         String query = "SELECT a_float FROM " + tableName + " WHERE organization_id=? and a_float NOT IN (?,?,?,?,?,?)";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -121,7 +111,6 @@ public class NotQueryIT extends BaseQueryIT {
     public void testNotInListOfDouble() throws Exception {
         String query = "SELECT a_double FROM " + tableName + " WHERE organization_id=? and a_double NOT IN (?,?,?,?,?,?)";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -150,7 +139,6 @@ public class NotQueryIT extends BaseQueryIT {
         String query = "SELECT entity_id -- and here comment\n" + 
         "FROM " + tableName + " WHERE organization_id=? and a_integer != 1 and a_integer <= 2";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -169,7 +157,6 @@ public class NotQueryIT extends BaseQueryIT {
         String query = "SELECT a_byte -- and here comment\n" + 
         "FROM " + tableName + " WHERE organization_id=? and a_byte != 1 and a_byte <= 2";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -188,7 +175,6 @@ public class NotQueryIT extends BaseQueryIT {
         String query = "SELECT a_short -- and here comment\n" + 
         "FROM " + tableName + " WHERE organization_id=? and a_short != 128 and a_short !=0 and a_short <= 129";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -207,7 +193,6 @@ public class NotQueryIT extends BaseQueryIT {
         String query = "SELECT a_float -- and here comment\n" + 
         "FROM " + tableName + " WHERE organization_id=? and a_float != CAST(0.01 AS FLOAT) and a_float <= CAST(0.02 AS FLOAT)";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -226,7 +211,6 @@ public class NotQueryIT extends BaseQueryIT {
         String query = "SELECT a_unsigned_float -- and here comment\n" + 
         "FROM " + tableName + " WHERE organization_id=? and a_unsigned_float != 0.01 and a_unsigned_float <= 0.02";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -245,7 +229,6 @@ public class NotQueryIT extends BaseQueryIT {
         String query = "SELECT a_double -- and here comment\n" + 
         "FROM " + tableName + " WHERE organization_id=? and a_double != CAST(0.0001 AS DOUBLE) and a_double <= CAST(0.0002 AS DOUBLE)";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -264,7 +247,6 @@ public class NotQueryIT extends BaseQueryIT {
         String query = "SELECT a_unsigned_double -- and here comment\n" + 
         "FROM " + tableName + " WHERE organization_id=? and a_unsigned_double != 0.0001 and a_unsigned_double <= 0.0002";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);
@@ -283,7 +265,6 @@ public class NotQueryIT extends BaseQueryIT {
         String query = "SELECT entity_id FROM // one more comment  \n" + tableName + 
         " WHERE organization_id=? and not a_integer = 1 and a_integer <= 2";
         Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts + 2)); // Execute at timestamp 2
         Connection conn = DriverManager.getConnection(getUrl(), props);
         try {
             PreparedStatement statement = conn.prepareStatement(query);

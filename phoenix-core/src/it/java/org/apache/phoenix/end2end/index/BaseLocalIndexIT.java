@@ -59,6 +59,9 @@ public abstract class BaseLocalIndexIT extends BaseUniqueNamesOwnClusterIT {
         serverProps.put(QueryServices.IS_NAMESPACE_MAPPING_ENABLED, "true");
         Map<String, String> clientProps = Maps.newHashMapWithExpectedSize(1);
         clientProps.put(QueryServices.IS_NAMESPACE_MAPPING_ENABLED, "true");
+        // setting update frequency to a large value to test out that we are
+        // generating stats for local indexes
+        clientProps.put(QueryServices.MIN_STATS_UPDATE_FREQ_MS_ATTRIB, "120000");
         setUpTestDriver(new ReadOnlyProps(serverProps.entrySet().iterator()), new ReadOnlyProps(clientProps.entrySet().iterator()));
     }
 
@@ -69,6 +72,10 @@ public abstract class BaseLocalIndexIT extends BaseUniqueNamesOwnClusterIT {
     }
 
     protected void createBaseTable(String tableName, Integer saltBuckets, String splits) throws SQLException {
+        createBaseTable(tableName, saltBuckets, splits, null);
+    }
+
+    protected void createBaseTable(String tableName, Integer saltBuckets, String splits, String cf) throws SQLException {
         Connection conn = getConnection();
         if (isNamespaceMapped) {
             conn.createStatement().execute("CREATE SCHEMA IF NOT EXISTS " + schemaName);
@@ -77,7 +84,7 @@ public abstract class BaseLocalIndexIT extends BaseUniqueNamesOwnClusterIT {
                 "k1 INTEGER NOT NULL,\n" +
                 "k2 INTEGER NOT NULL,\n" +
                 "k3 INTEGER,\n" +
-                "v1 VARCHAR,\n" +
+                (cf != null ? (cf+'.') : "") + "v1 VARCHAR,\n" +
                 "CONSTRAINT pk PRIMARY KEY (t_id, k1, k2))\n"
                         + (saltBuckets != null && splits == null ? (" salt_buckets=" + saltBuckets) : ""
                         + (saltBuckets == null && splits != null ? (" split on " + splits) : ""));

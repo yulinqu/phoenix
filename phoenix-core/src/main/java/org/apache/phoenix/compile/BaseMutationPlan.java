@@ -64,4 +64,24 @@ public abstract class BaseMutationPlan implements MutationPlan {
         return Collections.emptySet();
     }
 
+    @Override
+    public Long getEstimatedRowsToScan() throws SQLException {
+        return 0l;
+    }
+
+    @Override
+    public Long getEstimatedBytesToScan() throws SQLException {
+        return 0l;
+    }
+
+    @Override
+    public Long getEstimateInfoTimestamp() throws SQLException {
+        return 0l;
+    }
+
+    @Override
+    public QueryPlan getQueryPlan() {
+        return null;
+    }
+
 }

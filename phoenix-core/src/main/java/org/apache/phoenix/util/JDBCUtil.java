@@ -133,7 +133,11 @@ public class JDBCUtil {
         return (scnStr == null ? null : Long.parseLong(scnStr));
     }
 
-    @Deprecated // use getMutateBatchSizeBytes
+    public static Long getBuildIndexSCN(String url, Properties info) throws SQLException {
+        String scnStr = findProperty(url, info, PhoenixRuntime.BUILD_INDEX_AT_ATTRIB);
+        return (scnStr == null ? null : Long.parseLong(scnStr));
+    }
+
     public static int getMutateBatchSize(String url, Properties info, ReadOnlyProps props) throws SQLException {
         String batchSizeStr = findProperty(url, info, PhoenixRuntime.UPSERT_BATCH_SIZE_ATTRIB);
         return (batchSizeStr == null ? props.getInt(QueryServices.MUTATE_BATCH_SIZE_ATTRIB, QueryServicesOptions.DEFAULT_MUTATE_BATCH_SIZE) : Integer.parseInt(batchSizeStr));

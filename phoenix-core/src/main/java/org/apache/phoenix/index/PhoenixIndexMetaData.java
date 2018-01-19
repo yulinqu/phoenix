@@ -22,26 +22,29 @@ import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
 import org.apache.phoenix.cache.GlobalCache;
 import org.apache.phoenix.cache.IndexMetaDataCache;
 import org.apache.phoenix.cache.ServerCacheClient;
 import org.apache.phoenix.cache.TenantCache;
 import org.apache.phoenix.coprocessor.BaseScannerRegionObserver;
+import org.apache.phoenix.coprocessor.BaseScannerRegionObserver.ReplayWrite;
 import org.apache.phoenix.exception.SQLExceptionCode;
 import org.apache.phoenix.exception.SQLExceptionInfo;
-import org.apache.phoenix.execute.MutationState;
 import org.apache.phoenix.hbase.index.covered.IndexMetaData;
 import org.apache.phoenix.hbase.index.util.ImmutableBytesPtr;
+import org.apache.phoenix.transaction.PhoenixTransactionContext;
+import org.apache.phoenix.transaction.TransactionFactory;
 import org.apache.phoenix.util.PhoenixRuntime;
 import org.apache.phoenix.util.ServerUtil;
-import org.apache.tephra.Transaction;
 
 public class PhoenixIndexMetaData implements IndexMetaData {
     private final Map<String, byte[]> attributes;
     private final IndexMetaDataCache indexMetaDataCache;
-    private final boolean ignoreNewerMutations;
+    private final ReplayWrite replayWrite;
     private final boolean isImmutable;
+    private final boolean hasNonPkColumns;
     
     private static IndexMetaDataCache getIndexMetaData(RegionCoprocessorEnvironment env, Map<String, byte[]> attributes) throws IOException {
         if (attributes == null) { return IndexMetaDataCache.EMPTY_INDEX_META_DATA_CACHE; }
@@ -56,7 +59,7 @@ public class PhoenixIndexMetaData implements IndexMetaData {
         byte[] txState = attributes.get(BaseScannerRegionObserver.TX_STATE);
         if (md != null) {
             final List<IndexMaintainer> indexMaintainers = IndexMaintainer.deserialize(md, useProto);
-            final Transaction txn = MutationState.decodeTransaction(txState);
+            final PhoenixTransactionContext txnContext = TransactionFactory.getTransactionFactory().getTransactionContext(txState);
             return new IndexMetaDataCache() {
 
                 @Override
@@ -68,8 +71,8 @@ public class PhoenixIndexMetaData implements IndexMetaData {
                 }
 
                 @Override
-                public Transaction getTransaction() {
-                    return txn;
+                public PhoenixTransactionContext getTransactionContext() {
+                    return txnContext;
                 }
 
             };
@@ -90,19 +93,30 @@ public class PhoenixIndexMetaData implements IndexMetaData {
 
     }
 
+    public static boolean isIndexRebuild(Map<String,byte[]> attributes) {
+        return attributes.get(BaseScannerRegionObserver.REPLAY_WRITES) != null;
+    }
+    
+    public static ReplayWrite getReplayWrite(Map<String,byte[]> attributes) {
+        return ReplayWrite.fromBytes(attributes.get(BaseScannerRegionObserver.REPLAY_WRITES));
+    }
+    
     public PhoenixIndexMetaData(RegionCoprocessorEnvironment env, Map<String,byte[]> attributes) throws IOException {
         this.indexMetaDataCache = getIndexMetaData(env, attributes);
         boolean isImmutable = true;
+        boolean hasNonPkColumns = false;
         for (IndexMaintainer maintainer : indexMetaDataCache.getIndexMaintainers()) {
             isImmutable &= maintainer.isImmutableRows();
+            hasNonPkColumns |= !maintainer.getIndexedColumns().isEmpty();
         }
         this.isImmutable = isImmutable;
+        this.hasNonPkColumns = hasNonPkColumns;
         this.attributes = attributes;
-        this.ignoreNewerMutations = attributes.get(BaseScannerRegionObserver.IGNORE_NEWER_MUTATIONS) != null;
+        this.replayWrite = getReplayWrite(attributes);
     }
     
-    public Transaction getTransaction() {
-        return indexMetaDataCache.getTransaction();
+    public PhoenixTransactionContext getTransactionContext() {
+        return indexMetaDataCache.getTransactionContext();
     }
     
     public List<IndexMaintainer> getIndexMaintainers() {
@@ -113,12 +127,17 @@ public class PhoenixIndexMetaData implements IndexMetaData {
         return attributes;
     }
     
-    public boolean ignoreNewerMutations() {
-        return ignoreNewerMutations;
+    @Override
+    public ReplayWrite getReplayWrite() {
+        return replayWrite;
+    }
+    
+    public boolean isImmutableRows() {
+        return isImmutable;
     }
 
     @Override
-    public boolean isImmutableRows() {
-        return isImmutable;
+    public boolean requiresPriorRowState(Mutation m) {
+        return !isImmutable || (indexMetaDataCache.getIndexMaintainers().get(0).isRowDeleted(m) && hasNonPkColumns);
     }
 }

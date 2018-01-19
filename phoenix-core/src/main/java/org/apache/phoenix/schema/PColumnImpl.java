@@ -17,6 +17,7 @@
  */
 package org.apache.phoenix.schema;
 
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.util.ByteStringer;
 import org.apache.phoenix.coprocessor.generated.PTableProtos;
 import org.apache.phoenix.query.QueryConstants;
@@ -42,26 +43,58 @@ public class PColumnImpl implements PColumn {
     private boolean isRowTimestamp;
     private boolean isDynamic;
     private byte[] columnQualifierBytes;
-    
+    private boolean derived;
+    private long timestamp;
+
     public PColumnImpl() {
     }
 
-    public PColumnImpl(PName name,
-                       PName familyName,
-                       PDataType dataType,
-                       Integer maxLength,
-                       Integer scale,
-                       boolean nullable,
-                       int position,
-                       SortOrder sortOrder, Integer arrSize, byte[] viewConstant, boolean isViewReferenced, String expressionStr, boolean isRowTimestamp, boolean isDynamic, byte[] columnQualifierBytes) {
-        init(name, familyName, dataType, maxLength, scale, nullable, position, sortOrder, arrSize, viewConstant, isViewReferenced, expressionStr, isRowTimestamp, isDynamic, columnQualifierBytes);
-    }
-
     public PColumnImpl(PColumn column, int position) {
-        this(column.getName(), column.getFamilyName(), column.getDataType(), column.getMaxLength(),
-                column.getScale(), column.isNullable(), position, column.getSortOrder(), column.getArraySize(), column.getViewConstant(), column.isViewReferenced(), column.getExpressionStr(), column.isRowTimestamp(), column.isDynamic(), column.getColumnQualifierBytes());
+        this(column, column.isDerived(), position);
     }
 
+    public PColumnImpl(PColumn column, byte[] viewConstant, boolean isViewReferenced) {
+        this(column.getName(), column.getFamilyName(), column.getDataType(), column.getMaxLength(),
+                column.getScale(), column.isNullable(), column.getPosition(), column.getSortOrder(), column.getArraySize(), viewConstant, isViewReferenced, column.getExpressionStr(), column.isRowTimestamp(), column.isDynamic(), column.getColumnQualifierBytes(),
+                column.getTimestamp(), column.isDerived());
+    }
+
+    public PColumnImpl(PColumn column, boolean derivedColumn, int position) {
+        this(column, derivedColumn, position, column.getViewConstant());
+    }
+
+    public PColumnImpl(PColumn column, boolean derivedColumn, int position, byte[] viewConstant) {
+        this(column.getName(), column.getFamilyName(), column.getDataType(), column.getMaxLength(),
+            column.getScale(), column.isNullable(), position, column.getSortOrder(), column.getArraySize(), viewConstant, column.isViewReferenced(), column.getExpressionStr(), column.isRowTimestamp(), column.isDynamic(), column.getColumnQualifierBytes(),
+            column.getTimestamp(), derivedColumn);
+    }
+    
+    public PColumnImpl(PName name, PName familyName, PDataType dataType, Integer maxLength, Integer scale, boolean nullable,
+        int position, SortOrder sortOrder, Integer arrSize, byte[] viewConstant, boolean isViewReferenced, String expressionStr, boolean isRowTimestamp, boolean isDynamic,
+        byte[] columnQualifierBytes, long timestamp) {
+        this(name, familyName, dataType, maxLength, scale, nullable, position, sortOrder, arrSize, viewConstant, isViewReferenced, expressionStr, isRowTimestamp, isDynamic, columnQualifierBytes, timestamp, false);
+    }
+
+    public PColumnImpl(PName name, PName familyName, PDataType dataType, Integer maxLength, Integer scale, boolean nullable,
+        int position, SortOrder sortOrder, Integer arrSize, byte[] viewConstant, boolean isViewReferenced, String expressionStr, boolean isRowTimestamp, boolean isDynamic,
+        byte[] columnQualifierBytes, long timestamp, boolean derived) {
+        init(name, familyName, dataType, maxLength, scale, nullable, position, sortOrder, arrSize, viewConstant, isViewReferenced, expressionStr, isRowTimestamp, isDynamic, columnQualifierBytes, timestamp, derived);
+    }
+
+    private PColumnImpl(PName familyName, PName columnName, Long timestamp) {
+        this.familyName = familyName;
+        this.name = columnName;
+        this.derived = true;
+        if (timestamp!=null) {
+            this.timestamp = timestamp;
+        }
+    }
+
+    // a derived column has null type
+    public static PColumnImpl createExcludedColumn(PName familyName, PName columnName, Long timestamp) {
+        return new PColumnImpl(familyName, columnName, timestamp);
+    }
+    
     private void init(PName name,
             PName familyName,
             PDataType dataType,
@@ -71,7 +104,15 @@ public class PColumnImpl implements PColumn {
             int position,
             SortOrder sortOrder,
             Integer arrSize,
-            byte[] viewConstant, boolean isViewReferenced, String expressionStr, boolean isRowTimestamp, boolean isDynamic, byte[] columnQualifierBytes) {
+            byte[] viewConstant,
+        boolean isViewReferenced,
+        String expressionStr,
+        boolean isRowTimestamp,
+        boolean isDynamic,
+        byte[] columnQualifierBytes,
+        long timestamp,
+        boolean derived
+    ) {
     	Preconditions.checkNotNull(sortOrder);
         this.dataType = dataType;
         if (familyName == null) {
@@ -97,6 +138,8 @@ public class PColumnImpl implements PColumn {
         this.isRowTimestamp = isRowTimestamp;
         this.isDynamic = isDynamic;
         this.columnQualifierBytes = columnQualifierBytes;
+        this.timestamp = timestamp;
+        this.derived = derived;
     }
 
     @Override
@@ -137,6 +180,16 @@ public class PColumnImpl implements PColumn {
     }
 
     @Override
+    public long getTimestamp() {
+        return timestamp;
+    }
+
+    @Override
+    public boolean isExcluded() {
+        return dataType == null;
+    }
+
+    @Override
     public boolean isNullable() {
         // Only PK columns can be NOT NULL. We prevent this in the
         // CREATE TABLE statement now (PHOENIX-1266), but this extra
@@ -160,14 +213,14 @@ public class PColumnImpl implements PColumn {
         return (familyName == null ? "" : familyName.toString() + QueryConstants.NAME_SEPARATOR) + name.toString();
     }
     
-    @Override
-    public int hashCode() {
-        final int prime = 31;
-        int result = 1;
-        result = prime * result + ((familyName == null) ? 0 : familyName.hashCode());
-        result = prime * result + ((name == null) ? 0 : name.hashCode());
-        return result;
-    }
+	@Override
+	public int hashCode() {
+	    final int prime = 31;
+	    int result = 1;
+	    result = prime * result + ((familyName == null) ? 0 : familyName.hashCode());
+	    result = prime * result + ((name == null) ? 0 : name.hashCode());
+	    return result;
+	}
 
     @Override
     public boolean equals(Object obj) {
@@ -267,8 +320,17 @@ public class PColumnImpl implements PColumn {
         if (column.hasColumnQualifierBytes()) {
             columnQualifierBytes = column.getColumnQualifierBytes().toByteArray();
         }
+        long timestamp = HConstants.LATEST_TIMESTAMP;
+        if (column.hasTimestamp()) {
+            timestamp = column.getTimestamp();
+        }
+        boolean derived = false;
+        if (column.hasDerived()) {
+            derived = column.getDerived();
+        }
         return new PColumnImpl(columnName, familyName, dataType, maxLength, scale, nullable, position, sortOrder,
-                arraySize, viewConstant, isViewReferenced, expressionStr, isRowTimestamp, isDynamic, columnQualifierBytes);
+                arraySize, viewConstant, isViewReferenced, expressionStr, isRowTimestamp, isDynamic, columnQualifierBytes,
+            timestamp, derived);
     }
 
     public static PTableProtos.PColumn toProto(PColumn column) {
@@ -302,6 +364,14 @@ public class PColumnImpl implements PColumn {
         if (column.getColumnQualifierBytes() != null) {
             builder.setColumnQualifierBytes(ByteStringer.wrap(column.getColumnQualifierBytes()));
         }
+        if (column.getTimestamp() != HConstants.LATEST_TIMESTAMP) {
+            builder.setTimestamp(column.getTimestamp());
+        }
+        builder.setDerived(column.isDerived());
         return builder.build();
+    }
+
+    public boolean isDerived() {
+        return derived;
     }
 }

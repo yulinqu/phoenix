@@ -55,6 +55,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellScanner;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HTableInterface;
@@ -107,6 +108,7 @@ import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.query.QueryServices;
 import org.apache.phoenix.query.QueryServicesOptions;
 import org.apache.phoenix.schema.PColumn;
+import org.apache.phoenix.schema.PIndexState;
 import org.apache.phoenix.schema.PLongColumn;
 import org.apache.phoenix.schema.PName;
 import org.apache.phoenix.schema.PTable;
@@ -120,6 +122,7 @@ import org.apache.phoenix.schema.stats.GuidePostsKey;
 import org.apache.phoenix.schema.tuple.Tuple;
 import org.apache.phoenix.schema.types.PDataType;
 
+import com.google.common.base.Objects;
 import com.google.common.collect.Lists;
 
 
@@ -127,6 +130,7 @@ import com.google.common.collect.Lists;
 public class TestUtil {
     private static final Log LOG = LogFactory.getLog(TestUtil.class);
     
+    private static final Long ZERO = new Long(0);
     public static final String DEFAULT_SCHEMA_NAME = "";
     public static final String DEFAULT_DATA_TABLE_NAME = "T";
     public static final String DEFAULT_INDEX_TABLE_NAME = "I";
@@ -361,11 +365,11 @@ public class TestUtil {
     }
 
     public static MultiKeyValueComparisonFilter multiKVFilter(Expression e) {
-        return  new MultiCQKeyValueComparisonFilter(e);
+        return  new MultiCQKeyValueComparisonFilter(e, false, ByteUtil.EMPTY_BYTE_ARRAY);
     }
     
     public static MultiEncodedCQKeyValueComparisonFilter multiEncodedKVFilter(Expression e, QualifierEncodingScheme encodingScheme) {
-        return  new MultiEncodedCQKeyValueComparisonFilter(e, encodingScheme);
+        return  new MultiEncodedCQKeyValueComparisonFilter(e, encodingScheme, false, null);
     }
 
     public static Expression and(Expression... expressions) {
@@ -638,13 +642,7 @@ public class TestUtil {
         conn.createStatement().execute(query);
     }
     
-    public static void analyzeTable(String url, long ts, String tableName) throws IOException, SQLException {
-        Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
-        props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(ts));
-        analyzeTable(url, props, tableName);
-    }
-
-    public static void analyzeTable(String url, Properties props, String tableName) throws IOException, SQLException {
+   public static void analyzeTable(String url, Properties props, String tableName) throws IOException, SQLException {
         Connection conn = DriverManager.getConnection(url, props);
         analyzeTable(conn, tableName);
         conn.close();
@@ -724,6 +722,22 @@ public class TestUtil {
                 public String getExpressionStr() {
                     return null;
                 }
+
+                @Override
+                public long getTimestamp() {
+                    return HConstants.LATEST_TIMESTAMP;
+                }
+
+                @Override
+                public boolean isDerived() {
+                    return false;
+                }
+
+                @Override
+                public boolean isExcluded() {
+                    return false;
+                }
+
                 @Override
                 public boolean isRowTimestamp() {
                     return false;
@@ -838,6 +852,8 @@ public class TestUtil {
     public static void dumpTable(HTableInterface table) throws IOException {
         System.out.println("************ dumping " + table + " **************");
         Scan s = new Scan();
+        s.setRaw(true);;
+        s.setMaxVersions();
         try (ResultScanner scanner = table.getScanner(s)) {
             Result result = null;
             while ((result = scanner.next()) != null) {
@@ -850,6 +866,171 @@ public class TestUtil {
             }
         }
         System.out.println("-----------------------------------------------");
+    }
+
+    public static void dumpIndexStatus(Connection conn, String indexName) throws IOException, SQLException {
+        try (HTableInterface table = conn.unwrap(PhoenixConnection.class).getQueryServices().getTable(PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES)) { 
+            System.out.println("************ dumping index status for " + indexName + " **************");
+            Scan s = new Scan();
+            s.setRaw(true);
+            s.setMaxVersions();
+            byte[] startRow = SchemaUtil.getTableKeyFromFullName(indexName);
+            s.setStartRow(startRow);
+            s.setStopRow(ByteUtil.nextKey(ByteUtil.concat(startRow, QueryConstants.SEPARATOR_BYTE_ARRAY)));
+            try (ResultScanner scanner = table.getScanner(s)) {
+                Result result = null;
+                while ((result = scanner.next()) != null) {
+                    CellScanner cellScanner = result.cellScanner();
+                    Cell current = null;
+                    while (cellScanner.advance()) {
+                        current = cellScanner.current();
+                        if (Bytes.compareTo(current.getQualifierArray(), current.getQualifierOffset(), current.getQualifierLength(), PhoenixDatabaseMetaData.INDEX_STATE_BYTES, 0, PhoenixDatabaseMetaData.INDEX_STATE_BYTES.length) == 0) {
+                            System.out.println(current.getTimestamp() + "/INDEX_STATE=" + PIndexState.fromSerializedValue(current.getValueArray()[current.getValueOffset()]));
+                        }
+                    }
+                }
+            }
+            System.out.println("-----------------------------------------------");
+    }
+    }
+
+    public static void waitForIndexRebuild(Connection conn, String fullIndexName, PIndexState indexState) throws InterruptedException, SQLException {
+        waitForIndexState(conn, fullIndexName, indexState, 0L);
+    }
+
+    private static class IndexStateCheck {
+    	public final PIndexState indexState;
+    	public final Long indexDisableTimestamp;
+    	public final Boolean success;
+    	
+    	public IndexStateCheck(PIndexState indexState, Long indexDisableTimestamp, Boolean success) {
+    		this.indexState = indexState;
+    		this.indexDisableTimestamp = indexDisableTimestamp;
+    		this.success = success;
+    	}
+    }
+    
+    public static void waitForIndexState(Connection conn, String fullIndexName, PIndexState expectedIndexState, Long expectedIndexDisableTimestamp) throws InterruptedException, SQLException {
+        int maxTries = 60, nTries = 0;
+        do {
+            Thread.sleep(1000); // sleep 1 sec
+            IndexStateCheck state = checkIndexStateInternal(conn, fullIndexName, expectedIndexState, expectedIndexDisableTimestamp);
+            if (state.success != null) {
+                if (Boolean.TRUE.equals(state.success)) {
+                    return;
+                }
+                fail("Index state will not become " + expectedIndexState);
+            }
+        } while (++nTries < maxTries);
+        fail("Ran out of time waiting for index state to become " + expectedIndexState);
+    }
+
+    public static boolean checkIndexState(Connection conn, String fullIndexName, PIndexState expectedIndexState, Long expectedIndexDisableTimestamp) throws SQLException {
+        return Boolean.TRUE.equals(checkIndexStateInternal(conn,fullIndexName, expectedIndexState, expectedIndexDisableTimestamp).success);
+    }
+    
+    public static void assertIndexState(Connection conn, String fullIndexName, PIndexState expectedIndexState, Long expectedIndexDisableTimestamp) throws SQLException {
+    	IndexStateCheck state = checkIndexStateInternal(conn,fullIndexName, expectedIndexState, expectedIndexDisableTimestamp);
+        if (!Boolean.TRUE.equals(state.success)) {
+        	if (expectedIndexState != null) {
+        		assertEquals(expectedIndexState, state.indexState);
+        	}
+        	if (expectedIndexDisableTimestamp != null) {
+        		assertEquals(expectedIndexDisableTimestamp, state.indexDisableTimestamp);
+        	}
+        }
+    }
+    
+    public static PIndexState getIndexState(Connection conn, String fullIndexName) throws SQLException {
+    	IndexStateCheck state = checkIndexStateInternal(conn, fullIndexName, null, null);
+    	return state.indexState;
+    }
+    
+    private static IndexStateCheck checkIndexStateInternal(Connection conn, String fullIndexName, PIndexState expectedIndexState, Long expectedIndexDisableTimestamp) throws SQLException {
+        String schema = SchemaUtil.getSchemaNameFromFullName(fullIndexName);
+        String index = SchemaUtil.getTableNameFromFullName(fullIndexName);
+        String query = "SELECT CAST(" + PhoenixDatabaseMetaData.INDEX_DISABLE_TIMESTAMP + " AS BIGINT)," + PhoenixDatabaseMetaData.INDEX_STATE + " FROM " +
+                PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME + " WHERE (" + PhoenixDatabaseMetaData.TABLE_SCHEM + "," + PhoenixDatabaseMetaData.TABLE_NAME
+                + ") = (" + "'" + schema + "','" + index + "') "
+                + "AND " + PhoenixDatabaseMetaData.COLUMN_FAMILY + " IS NULL AND " + PhoenixDatabaseMetaData.COLUMN_NAME + " IS NULL";
+        ResultSet rs = conn.createStatement().executeQuery(query);
+        Long actualIndexDisableTimestamp = null;
+        PIndexState actualIndexState = null;
+        if (rs.next()) {
+            actualIndexDisableTimestamp = rs.getLong(1);
+            actualIndexState = PIndexState.fromSerializedValue(rs.getString(2));
+            boolean matchesExpected = (expectedIndexDisableTimestamp == null || Objects.equal(actualIndexDisableTimestamp, expectedIndexDisableTimestamp)) 
+                    && (expectedIndexState == null || actualIndexState == expectedIndexState);
+            if (matchesExpected) {
+                return new IndexStateCheck(actualIndexState, actualIndexDisableTimestamp, Boolean.TRUE);
+            }
+            if (ZERO.equals(actualIndexDisableTimestamp)) {
+                return new IndexStateCheck(actualIndexState, actualIndexDisableTimestamp, Boolean.FALSE);
+            }
+        }
+        return new IndexStateCheck(actualIndexState, actualIndexDisableTimestamp, null);
+    }
+
+    public static long getRowCount(Connection conn, String tableName) throws SQLException {
+        ResultSet rs = conn.createStatement().executeQuery("SELECT /*+ NO_INDEX */ count(*) FROM " + tableName);
+        assertTrue(rs.next());
+        return rs.getLong(1);
+    }
+    
+    public static void addCoprocessor(Connection conn, String tableName, Class coprocessorClass) throws Exception {
+        int priority = QueryServicesOptions.DEFAULT_COPROCESSOR_PRIORITY + 100;
+        ConnectionQueryServices services = conn.unwrap(PhoenixConnection.class).getQueryServices();
+        HTableDescriptor descriptor = services.getTableDescriptor(Bytes.toBytes(tableName));
+		if (!descriptor.getCoprocessors().contains(coprocessorClass.getName())) {
+			descriptor.addCoprocessor(coprocessorClass.getName(), null, priority, null);
+		}else{
+			return;
+		}
+        final int retries = 10;
+        int numTries = 10;
+        try (HBaseAdmin admin = services.getAdmin()) {
+            admin.modifyTable(Bytes.toBytes(tableName), descriptor);
+            while (!admin.getTableDescriptor(Bytes.toBytes(tableName)).equals(descriptor)
+                    && numTries > 0) {
+                numTries--;
+                if (numTries == 0) {
+                    throw new Exception(
+                            "Failed to add " + coprocessorClass.getName() + " after "
+                                    + retries + " retries.");
+                }
+                Thread.sleep(1000);
+            }
+        }
+    }
+
+    public static void removeCoprocessor(Connection conn, String tableName, Class coprocessorClass) throws Exception {
+        ConnectionQueryServices services = conn.unwrap(PhoenixConnection.class).getQueryServices();
+        HTableDescriptor descriptor = services.getTableDescriptor(Bytes.toBytes(tableName));
+        if (descriptor.getCoprocessors().contains(coprocessorClass.getName())) {
+            descriptor.removeCoprocessor(coprocessorClass.getName());
+        }else{
+            return;
+        }
+        final int retries = 10;
+        int numTries = retries;
+        try (HBaseAdmin admin = services.getAdmin()) {
+            admin.modifyTable(Bytes.toBytes(tableName), descriptor);
+            while (!admin.getTableDescriptor(Bytes.toBytes(tableName)).equals(descriptor)
+                    && numTries > 0) {
+                numTries--;
+                if (numTries == 0) {
+                    throw new Exception(
+                            "Failed to remove " + coprocessorClass.getName() + " after "
+                                    + retries + " retries.");
+                }
+                Thread.sleep(1000);
+            }
+        }
+    }
+     
+    public static boolean compare(CompareOp op, ImmutableBytesWritable lhsOutPtr, ImmutableBytesWritable rhsOutPtr) {
+        int compareResult = Bytes.compareTo(lhsOutPtr.get(), lhsOutPtr.getOffset(), lhsOutPtr.getLength(), rhsOutPtr.get(), rhsOutPtr.getOffset(), rhsOutPtr.getLength());
+        return ByteUtil.compare(op, compareResult);
     }
 
 }
